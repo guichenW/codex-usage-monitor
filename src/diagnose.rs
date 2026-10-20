@@ -14,8 +14,9 @@ pub fn init() -> Result<PathBuf, String> {
     let path = std::env::temp_dir().join("codex-usage.log");
     let file = OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
+        // A relaunched child starts logging before the previous process exits.
+        // Preserve both sides of the handover instead of truncating its cause.
+        .append(true)
         .open(&path)
         .map_err(|e| format!("Unable to open diagnostic log file {}: {e}", path.display()))?;
 
@@ -42,7 +43,12 @@ pub fn log(message: impl AsRef<str>) {
         .unwrap_or(0);
 
     if let Ok(mut file) = state.file.lock() {
-        let _ = writeln!(file, "[{timestamp}] {}", message.as_ref());
+        let entry = format!(
+            "[{timestamp}] [pid={}] {}\n",
+            std::process::id(),
+            message.as_ref()
+        );
+        let _ = file.write_all(entry.as_bytes());
         let _ = file.flush();
     }
 }

@@ -192,8 +192,13 @@ fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
         .set("Accept", GITHUB_API_ACCEPT)
         .set("User-Agent", user_agent())
         .set("X-GitHub-Api-Version", GITHUB_API_VERSION)
-        .call()
-        .map_err(|e| format!("Unable to check GitHub releases: {e}"))?;
+        .call();
+    let response = match response {
+        Ok(response) => response,
+        // A newly published fork may not have any releases yet.
+        Err(ureq::Error::Status(404, _)) => return Ok(None),
+        Err(error) => return Err(format!("Unable to check GitHub releases: {error}")),
+    };
 
     let release: GitHubRelease = response
         .into_json()
@@ -248,7 +253,8 @@ fn parse_release_checksum(content: &str) -> Result<String, String> {
 fn build_agent() -> Result<ureq::Agent, String> {
     let tls = native_tls::TlsConnector::new()
         .map_err(|e| format!("Unable to initialize TLS support for update checks: {e}"))?;
-    Ok(ureq::AgentBuilder::new()
+    Ok(crate::proxy::agent_builder()
+        .map_err(str::to_owned)?
         .timeout(Duration::from_secs(30))
         .tls_connector(std::sync::Arc::new(tls))
         .build())

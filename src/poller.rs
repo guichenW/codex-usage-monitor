@@ -13,6 +13,7 @@ use crate::diagnose;
 use crate::localization::Strings;
 use crate::models::{UsageData, UsageSection};
 use crate::native_interop;
+use crate::proxy;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -320,6 +321,10 @@ fn cli_refresh_windows_token() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    if proxy::apply_to_command(&mut cmd).is_err() {
+        diagnose::log("invalid proxy settings; skipping Windows Claude token refresh");
+        return;
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(error) => {
@@ -363,6 +368,10 @@ fn cli_refresh_wsl_token(distro: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    if proxy::apply_to_command(&mut cmd).is_err() {
+        diagnose::log("invalid proxy settings; skipping WSL Claude token refresh");
+        return;
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(error) => {
@@ -407,6 +416,10 @@ fn cli_refresh_codex_token() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    if proxy::apply_to_command(&mut cmd).is_err() {
+        diagnose::log("invalid proxy settings; skipping Windows Codex token refresh");
+        return;
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(error) => {
@@ -530,7 +543,8 @@ fn resolve_windows_codex_path() -> String {
 
 fn build_agent() -> Result<ureq::Agent, PollError> {
     let tls = native_tls::TlsConnector::new().map_err(|_| PollError::RequestFailed)?;
-    Ok(ureq::AgentBuilder::new()
+    Ok(proxy::agent_builder()
+        .map_err(|_| PollError::RequestFailed)?
         .timeout(Duration::from_secs(30))
         .tls_connector(std::sync::Arc::new(tls))
         .build())

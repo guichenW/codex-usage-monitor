@@ -31,6 +31,18 @@ The log is written to `%TEMP%\codex-usage.log`. It includes:
 
 The log does not include access tokens, refresh tokens, credential file contents, or API response bodies.
 
+## Proxy settings
+
+Open **Settings > Proxy settings...** from the taskbar widget or tray menu.
+
+- **Use environment variables** preserves the existing `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` behavior.
+- **Use a custom HTTP proxy** saves an address such as `http://127.0.0.1:7897`. An HTTP proxy also tunnels HTTPS requests. A bare `127.0.0.1:7897` address is normalized automatically.
+- **Connect directly** bypasses proxy environment variables for the monitor's requests and Windows token-refresh subprocesses.
+
+The preference is saved under `proxy` in `%APPDATA%\CodexUsage\settings.json` and is restored at startup. It applies to usage requests, GitHub update checks/downloads, and proxy variables passed to local token-refresh commands. Saving triggers a manual refresh; an existing in-flight request can finish before its queued refresh uses the new setting. Existing server rate-limit deadlines still apply.
+
+Only HTTP proxy addresses are accepted by the custom mode. Cancel leaves the saved preference unchanged. Diagnostic logs identify the selected mode without printing the proxy address or credentials.
+
 ## Update failures
 
 Direct installations and portable copies download only the exact `codex-usage.exe` asset and verify it against `codex-usage.exe.sha256` from the same GitHub Release. The updater keeps the previous EXE until the downloaded version has been installed and restarted successfully. If restart fails, the old EXE is restored.

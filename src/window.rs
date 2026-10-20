@@ -27,6 +27,8 @@ use crate::native_interop::{
 use crate::poller;
 use crate::provider_icons::{self, Provider};
 use crate::provider_poll;
+use crate::proxy::{self, ProxySettings};
+use crate::proxy_dialog;
 use crate::quota_refresh;
 use crate::quota_text;
 use crate::quota_tooltip;
@@ -62,6 +64,7 @@ struct AppState {
     language_override: Option<LanguageId>,
     language: LanguageId,
     appearance: Appearance,
+    proxy: ProxySettings,
     install_channel: InstallChannel,
 
     session_percent: f64,
@@ -164,6 +167,7 @@ const IDM_FONT_STANDARD: u16 = 97;
 const IDM_FONT_LARGE: u16 = 98;
 const IDM_APPEARANCE_RECOMMENDED: u16 = 99;
 const IDM_APPEARANCE_RESET: u16 = 100;
+const IDM_PROXY_SETTINGS: u16 = 101;
 const IDM_MONITOR_FIRST: u16 = 200;
 const MAX_MONITOR_MENU_ITEMS: usize = 100;
 
@@ -250,8 +254,20 @@ fn relaunch_self() {
         .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
         .spawn()
     {
-        Ok(_) => {
-            diagnose::log("watchdog: relaunched fresh instance, exiting old one");
+        Ok(child) => {
+            let hwnd = {
+                let state = lock_state();
+                state.as_ref().map(|s| s.hwnd.to_hwnd())
+            };
+            if let Some(hwnd) = hwnd {
+                // process::exit bypasses WM_DESTROY. Delete using the original
+                // HWND even if Explorer has already destroyed that window.
+                tray_icon::remove_all(hwnd);
+            }
+            diagnose::log(format!(
+                "watchdog: relaunched pid={}, tray cleanup attempted, exiting old instance",
+                child.id()
+            ));
             std::process::exit(0);
         }
         Err(error) => {
@@ -425,6 +441,8 @@ impl Appearance {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SettingsFile {
     #[serde(default)]
+    proxy: ProxySettings,
+    #[serde(default)]
     tray_offset: i32,
     #[serde(default)]
     anchor_left: bool,
@@ -463,6 +481,7 @@ struct SettingsFile {
 impl Default for SettingsFile {
     fn default() -> Self {
         Self {
+            proxy: ProxySettings::default(),
             tray_offset: 0,
             anchor_left: false,
             taskbar_index: 0,
@@ -590,10 +609,11 @@ fn save_settings(settings: &SettingsFile) {
     }
 }
 
-fn save_state_settings() {
+fn save_state_settings() -> bool {
     let result = settings_store::save(&settings_path(), || {
         let state = lock_state();
         state.as_ref().map(|s| SettingsFile {
+            proxy: s.proxy.clone(),
             tray_offset: s.tray_offset,
             anchor_left: s.anchor_left,
             taskbar_index: s.taskbar_index,
@@ -617,7 +637,49 @@ fn save_state_settings() {
     });
     if let Err(error) = result {
         diagnose::log_error("unable to save settings", error);
+        false
+    } else {
+        true
     }
+}
+
+fn show_proxy_settings(hwnd: HWND) {
+    let (previous, language) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else { return };
+        (s.proxy.clone(), s.language)
+    };
+    let settings = match proxy_dialog::show(previous.clone(), language) {
+        Ok(Some(settings)) => settings,
+        Ok(None) => return,
+        Err(error) => {
+            show_error_message(hwnd, proxy_dialog::menu_label(language), &error);
+            return;
+        }
+    };
+    if settings == previous {
+        return;
+    }
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.proxy = settings.clone();
+        }
+    }
+    if !save_state_settings() {
+        if let Some(s) = lock_state().as_mut() {
+            s.proxy = previous;
+        }
+        let message = if language == LanguageId::SimplifiedChinese {
+            "无法保存代理设置，请检查设置目录的写入权限。"
+        } else {
+            "Unable to save proxy settings. Check that the settings directory is writable."
+        };
+        show_error_message(hwnd, proxy_dialog::menu_label(language), message);
+        return;
+    }
+    proxy::configure(settings);
+    request_poll(SendHwnd::from_hwnd(hwnd), true);
 }
 
 fn format_precise_reset_time(resets_at: Option<SystemTime>) -> Option<String> {
@@ -1938,6 +2000,7 @@ pub fn run() {
 
         let claude_code_available = poller::claude_code_credentials_available();
         let settings = load_settings(claude_code_available);
+        proxy::configure(settings.proxy.clone());
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -1999,6 +2062,7 @@ pub fn run() {
                 language_override,
                 language,
                 appearance: settings.appearance,
+                proxy: settings.proxy.clone(),
                 install_channel,
                 session_percent: 0.0,
                 session_text: "--".to_string(),
@@ -2132,6 +2196,8 @@ pub fn run() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        // Also cover message-loop exits that did not dispatch WM_DESTROY.
+        tray_icon::remove_all(hwnd);
     }
 }
 
@@ -3399,6 +3465,9 @@ unsafe extern "system" fn wnd_proc(
         WM_COMMAND => {
             let id = wparam.0 as u16;
             match id {
+                IDM_PROXY_SETTINGS => {
+                    show_proxy_settings(hwnd);
+                }
                 1 => {
                     {
                         let mut state = lock_state();
@@ -4197,6 +4266,14 @@ fn show_context_menu(hwnd: HWND) {
 
         // Settings submenu
         let settings_menu = CreatePopupMenu().unwrap();
+
+        let proxy_label = native_interop::wide_str(proxy_dialog::menu_label(language));
+        let _ = AppendMenuW(
+            settings_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_PROXY_SETTINGS as usize,
+            PCWSTR::from_raw(proxy_label.as_ptr()),
+        );
 
         let startup_str = native_interop::wide_str(strings.start_with_windows);
         let startup_flags = if is_startup_enabled() {
@@ -5042,6 +5119,32 @@ mod tests {
         };
         assert_eq!(format_local_system_time(local), "2026-07-17 18:30");
         assert_eq!(format_precise_reset_time(None), None);
+    }
+
+    #[test]
+    fn proxy_settings_persist_without_changing_legacy_preferences() {
+        let legacy: SettingsFile =
+            serde_json::from_str(r#"{"poll_interval_ms":300000,"widget_visible":false}"#).unwrap();
+        assert_eq!(legacy.proxy.mode, proxy::ProxyMode::Environment);
+        let configured = SettingsFile {
+            proxy: ProxySettings {
+                mode: proxy::ProxyMode::Custom,
+                url: proxy::DEFAULT_URL.to_owned(),
+            },
+            ..legacy
+        };
+        let path = std::env::temp_dir().join(format!(
+            "codex-proxy-settings-{}-{}.json",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        settings_store::save(&path, || Some(configured.clone())).unwrap();
+        let (restored, migrated) = load_settings_from_paths(&path, &path).unwrap();
+        assert!(!migrated);
+        assert_eq!(restored.proxy, configured.proxy);
+        assert_eq!(restored.poll_interval_ms, 300000);
+        assert!(!restored.widget_visible);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -8,6 +8,7 @@ fn main() {
     let numeric_version = pack_version(version);
 
     res.set_icon("src/icons/icon.ico")
+        .append_rc_content(include_str!("src/proxy_dialog.rc"))
         .set("FileVersion", version)
         .set("ProductVersion", version)
         .set_version_info(VersionInfo::FILEVERSION, numeric_version)

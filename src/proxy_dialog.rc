@@ -1,0 +1,30 @@
+// Keep this resource self-contained so cargo builds do not need a Visual
+// Studio developer shell's C/C++ include environment.
+#define DS_SETFONT       0x0040
+#define DS_MODALFRAME    0x0080
+#define DS_CENTER        0x0800
+#define WS_POPUP         0x80000000
+#define WS_CAPTION       0x00C00000
+#define WS_SYSMENU       0x00080000
+#define WS_EX_APPWINDOW  0x00040000
+#define WS_GROUP         0x00020000
+#define WS_TABSTOP       0x00010000
+#define ES_AUTOHSCROLL   0x0080
+#define IDOK            1
+#define IDCANCEL        2
+
+220 DIALOGEX 0, 0, 332, 174
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "Codex Usage - Proxy"
+FONT 9, "Segoe UI"
+BEGIN
+    AUTORADIOBUTTON "Use environment variables", 1101, 12, 12, 308, 12, WS_GROUP | WS_TABSTOP
+    AUTORADIOBUTTON "Use a custom HTTP proxy", 1102, 12, 33, 308, 12
+    LTEXT "Proxy address:", 1104, 24, 55, 284, 10
+    EDITTEXT 1105, 24, 69, 284, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    AUTORADIOBUTTON "Connect directly", 1103, 12, 99, 308, 12
+    LTEXT "HTTP proxies support HTTPS requests. Save to apply.", 1106, 12, 119, 308, 20
+    DEFPUSHBUTTON "Save", IDOK, 194, 150, 56, 16, WS_TABSTOP
+    PUSHBUTTON "Cancel", IDCANCEL, 256, 150, 56, 16, WS_TABSTOP
+END

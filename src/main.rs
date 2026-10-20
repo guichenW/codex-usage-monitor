@@ -7,6 +7,8 @@ mod native_interop;
 mod poller;
 mod provider_icons;
 mod provider_poll;
+mod proxy;
+mod proxy_dialog;
 mod quota_refresh;
 mod quota_text;
 mod quota_tooltip;

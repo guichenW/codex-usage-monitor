@@ -17,12 +17,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::codex_warmup;
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL, TIMER_TASKBAR_RETRY,
-    TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_CODEX_WARMUP, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL,
+    TIMER_TASKBAR_RETRY, TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::provider_icons::{self, Provider};
@@ -37,6 +38,7 @@ use crate::settings_store;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
+use crate::warmup_dialog;
 
 /// Wrapper to make HWND sendable across threads (safe for PostMessage usage)
 #[derive(Clone, Copy)]
@@ -65,6 +67,7 @@ struct AppState {
     language: LanguageId,
     appearance: Appearance,
     proxy: ProxySettings,
+    codex_warmup: codex_warmup::Settings,
     install_channel: InstallChannel,
 
     session_percent: f64,
@@ -168,6 +171,7 @@ const IDM_FONT_LARGE: u16 = 98;
 const IDM_APPEARANCE_RECOMMENDED: u16 = 99;
 const IDM_APPEARANCE_RESET: u16 = 100;
 const IDM_PROXY_SETTINGS: u16 = 101;
+const IDM_CODEX_WARMUP: u16 = 102;
 const IDM_MONITOR_FIRST: u16 = 200;
 const MAX_MONITOR_MENU_ITEMS: usize = 100;
 
@@ -441,6 +445,8 @@ impl Appearance {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SettingsFile {
     #[serde(default)]
+    codex_warmup: codex_warmup::Settings,
+    #[serde(default)]
     proxy: ProxySettings,
     #[serde(default)]
     tray_offset: i32,
@@ -481,6 +487,7 @@ struct SettingsFile {
 impl Default for SettingsFile {
     fn default() -> Self {
         Self {
+            codex_warmup: codex_warmup::Settings::default(),
             proxy: ProxySettings::default(),
             tray_offset: 0,
             anchor_left: false,
@@ -586,6 +593,10 @@ fn load_settings_from_paths(
 }
 
 fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
+    match settings.codex_warmup.clone().validated() {
+        Ok(normalized) => settings.codex_warmup = normalized,
+        Err(_) => settings.codex_warmup.enabled = false,
+    }
     if !(POLL_1_MIN..=POLL_1_HOUR).contains(&settings.poll_interval_ms) {
         settings.poll_interval_ms = POLL_15_MIN;
     }
@@ -613,6 +624,7 @@ fn save_state_settings() -> bool {
     let result = settings_store::save(&settings_path(), || {
         let state = lock_state();
         state.as_ref().map(|s| SettingsFile {
+            codex_warmup: s.codex_warmup.clone(),
             proxy: s.proxy.clone(),
             tray_offset: s.tray_offset,
             anchor_left: s.anchor_left,
@@ -680,6 +692,107 @@ fn show_proxy_settings(hwnd: HWND) {
     }
     proxy::configure(settings);
     request_poll(SendHwnd::from_hwnd(hwnd), true);
+}
+
+fn warmup_history_path() -> PathBuf {
+    settings_path().with_file_name("codex-warmup-history.json")
+}
+
+fn show_warmup_settings(hwnd: HWND) {
+    let (previous, language) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else { return };
+        (s.codex_warmup.clone(), s.language)
+    };
+    let summary = codex_warmup::latest_summary(
+        &warmup_history_path(),
+        matches!(
+            language,
+            LanguageId::SimplifiedChinese | LanguageId::TraditionalChinese
+        ),
+    );
+    let settings = match warmup_dialog::show(previous.clone(), language, summary) {
+        Ok(Some(settings)) => settings,
+        Ok(None) => return,
+        Err(error) => {
+            show_error_message(hwnd, warmup_dialog::menu_label(language), &error);
+            return;
+        }
+    };
+    if settings == previous {
+        return;
+    }
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.codex_warmup = settings.clone();
+        }
+    }
+    if !save_state_settings() {
+        if let Some(s) = lock_state().as_mut() {
+            s.codex_warmup = previous;
+        }
+        show_error_message(
+            hwnd,
+            warmup_dialog::menu_label(language),
+            if language == LanguageId::SimplifiedChinese {
+                "无法保存定时预热设置，请检查设置目录的写入权限。"
+            } else {
+                "Unable to save the warm-up settings. Check the settings directory permissions."
+            },
+        );
+        return;
+    }
+    unsafe {
+        if settings.enabled {
+            SetTimer(hwnd, TIMER_CODEX_WARMUP, 15_000, None);
+        } else {
+            let _ = KillTimer(hwnd, TIMER_CODEX_WARMUP);
+        }
+    }
+    diagnose::log(format!(
+        "codex scheduled warm-up enabled={}",
+        settings.enabled
+    ));
+    start_scheduled_warmup(SendHwnd::from_hwnd(hwnd));
+}
+
+fn start_scheduled_warmup(hwnd: SendHwnd) {
+    let (settings, proxy_settings) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else { return };
+        (s.codex_warmup.clone(), s.proxy.clone())
+    };
+    let Some(slot) = codex_warmup::current_slot(&settings) else {
+        return;
+    };
+    let Some(guard) = codex_warmup::try_start() else {
+        return;
+    };
+    let path = warmup_history_path();
+    let spawn_result = std::thread::Builder::new().name("codex-scheduled-warmup".into()).spawn(move || {
+        let _guard = guard;
+        let result = codex_warmup::execute_once(&path, &slot, || {
+            diagnose::log(format!("codex scheduled warm-up attempting slot={}", slot.key));
+            codex_warmup::send(&settings.model, || {
+                if !unsafe { IsWindow(hwnd.to_hwnd()).as_bool() } { return false; }
+                lock_state().as_ref().is_some_and(|s| s.codex_warmup.enabled && s.codex_warmup == settings && s.proxy == proxy_settings)
+            })
+        });
+        match result {
+            Ok(Some(record)) => {
+                diagnose::log(format!("codex scheduled warm-up slot={} status={:?} model={:?} tokens={:?} detail={}", record.slot, record.status, record.model, record.total_tokens, record.detail));
+                if record.status == codex_warmup::Status::Completed && unsafe { IsWindow(hwnd.to_hwnd()).as_bool() } {
+                    request_poll(hwnd, true);
+                }
+            }
+            Ok(None) => {},
+            Err(error) => diagnose::log_error("codex warm-up history failed; no replay will be attempted", error),
+        }
+    });
+    if let Err(error) = spawn_result {
+        diagnose::log_error("unable to start scheduled Codex warm-up", error);
+    }
 }
 
 fn format_precise_reset_time(resets_at: Option<SystemTime>) -> Option<String> {
@@ -2063,6 +2176,7 @@ pub fn run() {
                 language,
                 appearance: settings.appearance,
                 proxy: settings.proxy.clone(),
+                codex_warmup: settings.codex_warmup.clone(),
                 install_channel,
                 session_percent: 0.0,
                 session_text: "--".to_string(),
@@ -2163,6 +2277,9 @@ pub fn run() {
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
         SetTimer(hwnd, TIMER_FRESHNESS, 30_000, None);
+        if settings.codex_warmup.enabled {
+            SetTimer(hwnd, TIMER_CODEX_WARMUP, 15_000, None);
+        }
 
         // Watch for explorer.exe restarts so we can re-embed and re-add the tray
         // icon (the shell discards tray registrations when it restarts). This
@@ -3253,6 +3370,9 @@ unsafe extern "system" fn wnd_proc(
                     update_display();
                     render_layered();
                 }
+                TIMER_CODEX_WARMUP => {
+                    start_scheduled_warmup(SendHwnd::from_hwnd(hwnd));
+                }
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
                 }
@@ -3467,6 +3587,9 @@ unsafe extern "system" fn wnd_proc(
             match id {
                 IDM_PROXY_SETTINGS => {
                     show_proxy_settings(hwnd);
+                }
+                IDM_CODEX_WARMUP => {
+                    show_warmup_settings(hwnd);
                 }
                 1 => {
                     {
@@ -4273,6 +4396,21 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0),
             IDM_PROXY_SETTINGS as usize,
             PCWSTR::from_raw(proxy_label.as_ptr()),
+        );
+
+        let warmup_label = native_interop::wide_str(warmup_dialog::menu_label(language));
+        let warmup_enabled = lock_state()
+            .as_ref()
+            .is_some_and(|s| s.codex_warmup.enabled);
+        let _ = AppendMenuW(
+            settings_menu,
+            if warmup_enabled {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_CODEX_WARMUP as usize,
+            PCWSTR::from_raw(warmup_label.as_ptr()),
         );
 
         let startup_str = native_interop::wide_str(strings.start_with_windows);
@@ -5145,6 +5283,26 @@ mod tests {
         assert_eq!(restored.poll_interval_ms, 300000);
         assert!(!restored.widget_visible);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn weekly_warmup_settings_persist_and_old_settings_stay_disabled() {
+        let mut settings: SettingsFile =
+            serde_json::from_str(r#"{"proxy":{"mode":"direct"}}"#).unwrap();
+        assert!(!settings.codex_warmup.enabled);
+        settings.codex_warmup.enabled = true;
+        settings.codex_warmup.days[6].clear();
+        settings.codex_warmup.days[0] = vec!["7:00".into(), "13:00".into()];
+        let settings = normalize_settings(settings);
+        let path =
+            std::env::temp_dir().join(format!("codex-weekly-schedule-{}.json", std::process::id()));
+        settings_store::save(&path, || Some(settings.clone())).unwrap();
+        let (restored, _) = load_settings_from_paths(&path, &path).unwrap();
+        assert!(restored.codex_warmup.enabled);
+        assert_eq!(restored.codex_warmup.days[0], vec!["07:00", "13:00"]);
+        assert!(restored.codex_warmup.days[6].is_empty());
+        assert_eq!(restored.proxy.mode, proxy::ProxyMode::Direct);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

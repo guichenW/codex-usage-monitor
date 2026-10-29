@@ -9,6 +9,7 @@ fn main() {
 
     res.set_icon("src/icons/icon.ico")
         .append_rc_content(include_str!("src/proxy_dialog.rc"))
+        .append_rc_content(include_str!("src/warmup_dialog.rc"))
         .set("FileVersion", version)
         .set("ProductVersion", version)
         .set_version_info(VersionInfo::FILEVERSION, numeric_version)

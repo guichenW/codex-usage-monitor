@@ -1,0 +1,33 @@
+// Win32 styles: popup/caption/system menu, centered modal frame and dialog font.
+221 DIALOGEX 0, 0, 370, 340
+STYLE 0x80C808C0
+EXSTYLE 0x00040000
+CAPTION "Codex Usage - Weekly warm-up"
+FONT 9, "Segoe UI"
+BEGIN
+    AUTOCHECKBOX "Enable scheduled warm-up (computer local time)", 1201, 12, 12, 346, 12, 0x00010000
+    LTEXT "Every day:", 1202, 12, 35, 74, 10
+    EDITTEXT 1203, 90, 32, 178, 14, 0x00010080
+    PUSHBUTTON "Apply to week", 1204, 276, 32, 82, 15, 0x00010000
+    LTEXT "Monday", 1210, 12, 61, 45, 10
+    EDITTEXT 1220, 62, 58, 296, 14, 0x00010080
+    LTEXT "Tuesday", 1211, 12, 83, 45, 10
+    EDITTEXT 1221, 62, 80, 296, 14, 0x00010080
+    LTEXT "Wednesday", 1212, 12, 105, 45, 10
+    EDITTEXT 1222, 62, 102, 296, 14, 0x00010080
+    LTEXT "Thursday", 1213, 12, 127, 45, 10
+    EDITTEXT 1223, 62, 124, 296, 14, 0x00010080
+    LTEXT "Friday", 1214, 12, 149, 45, 10
+    EDITTEXT 1224, 62, 146, 296, 14, 0x00010080
+    LTEXT "Saturday", 1215, 12, 171, 45, 10
+    EDITTEXT 1225, 62, 168, 296, 14, 0x00010080
+    LTEXT "Sunday", 1216, 12, 193, 45, 10
+    EDITTEXT 1226, 62, 190, 296, 14, 0x00010080
+    LTEXT "Comma-separated HH:MM times. Leave a day blank to skip it.", 1205, 12, 214, 346, 12
+    LTEXT "Model:", 1206, 12, 237, 45, 10
+    EDITTEXT 1207, 62, 234, 296, 14, 0x00010080
+    LTEXT "No attempts yet.", 1208, 12, 259, 346, 26
+    LTEXT "Sends a real model request and uses quota. Missed times are not replayed.", 1209, 12, 290, 346, 20
+    DEFPUSHBUTTON "Save", 1, 228, 318, 62, 16, 0x00010000
+    PUSHBUTTON "Cancel", 2, 296, 318, 62, 16, 0x00010000
+END

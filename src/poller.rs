@@ -87,9 +87,9 @@ struct CodexAuthFile {
 }
 
 #[derive(Clone, Deserialize)]
-struct CodexTokenData {
-    access_token: String,
-    account_id: Option<String>,
+pub(crate) struct CodexTokenData {
+    pub(crate) access_token: String,
+    pub(crate) account_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -541,7 +541,7 @@ fn resolve_windows_codex_path() -> String {
     "codex.cmd".to_string()
 }
 
-fn build_agent() -> Result<ureq::Agent, PollError> {
+pub(crate) fn build_agent() -> Result<ureq::Agent, PollError> {
     let tls = native_tls::TlsConnector::new().map_err(|_| PollError::RequestFailed)?;
     Ok(proxy::agent_builder()
         .map_err(|_| PollError::RequestFailed)?
@@ -1287,7 +1287,7 @@ fn read_credentials_from_source(source: &CredentialSource) -> Option<Credentials
     }
 }
 
-fn codex_auth_path() -> Option<PathBuf> {
+pub(crate) fn codex_auth_path() -> Option<PathBuf> {
     if let Some(codex_home) = std::env::var_os("CODEX_HOME").map(PathBuf::from) {
         return Some(codex_home.join("auth.json"));
     }
@@ -1295,7 +1295,7 @@ fn codex_auth_path() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".codex").join("auth.json"))
 }
 
-fn read_codex_credentials() -> Option<CodexTokenData> {
+pub(crate) fn read_codex_credentials() -> Option<CodexTokenData> {
     let auth_path = codex_auth_path()?;
     let content = match std::fs::read_to_string(&auth_path) {
         Ok(content) => content,

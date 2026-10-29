@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod codex_warmup;
 mod diagnose;
 mod localization;
 mod models;
@@ -18,6 +19,7 @@ mod settings_store;
 mod theme;
 mod tray_icon;
 mod updater;
+mod warmup_dialog;
 mod window;
 
 fn main() {

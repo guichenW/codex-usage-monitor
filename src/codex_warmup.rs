@@ -11,7 +11,12 @@ use serde_json::{json, Value};
 
 use crate::{native_interop, poller, retry_after, settings_store};
 
+#[path = "warmup_schedule.rs"]
+mod schedule;
+pub use schedule::{cancel_deferred, tick};
+
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const QUOTA_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const FALLBACK_CLIENT_VERSION: &str = "0.164.0";
 const MAX_RECORDS: usize = 512;
 const DEFAULT_TIMES: [&str; 3] = ["07:00", "13:00", "19:00"];
@@ -146,11 +151,32 @@ pub fn try_start() -> Option<RunningGuard> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
+    WaitingForReset,
     Pending,
     Completed,
     Failed,
     Skipped,
     Cancelled,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verification {
+    #[default]
+    NotChecked,
+    Pending,
+    WindowStarted,
+    AlreadyActive,
+    NotConfirmed,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QuotaSnapshot {
+    pub checked_at: u64,
+    pub reset_at: Option<u64>,
+    pub window_seconds: Option<u64>,
+    pub used_percent: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -162,6 +188,24 @@ pub struct Record {
     pub model: Option<String>,
     pub total_tokens: Option<u64>,
     pub detail: String,
+    #[serde(default)]
+    pub next_check_at: Option<u64>,
+    #[serde(default)]
+    pub request_started_at: Option<u64>,
+    #[serde(default)]
+    pub quota_before: Option<QuotaSnapshot>,
+    #[serde(default)]
+    pub quota_after: Option<QuotaSnapshot>,
+    #[serde(default)]
+    pub verification: Verification,
+    #[serde(default)]
+    verification_attempts: u8,
+    #[serde(default)]
+    quota_check_failures: u8,
+    #[serde(default)]
+    scheduled_settings: Option<Settings>,
+    #[serde(default)]
+    account_fingerprint: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -220,84 +264,56 @@ impl Failure {
     }
 }
 
-/// The claim reaches disk before any network work. A restart, repeated timer
-/// tick or uncertain response therefore cannot repeat this date/time slot.
-pub fn execute_once(
-    path: &Path,
-    slot: &Slot,
-    send: impl FnOnce() -> Result<Completed, Failure>,
-) -> io::Result<Option<Record>> {
-    let now = epoch();
-    let initial = {
-        let _lock = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut history = read_history(path)?;
-        if history.records.contains_key(&slot.key) {
-            return Ok(None);
-        }
-        let blocked = history.blocked_until > now;
-        let record = Record {
-            slot: slot.key.clone(),
-            attempted_at: now,
-            finished_at: None,
-            status: if blocked {
-                Status::Skipped
-            } else {
-                Status::Pending
-            },
-            model: None,
-            total_tokens: None,
-            detail: if blocked {
-                "Server Retry-After deadline has not passed.".into()
-            } else {
-                "Attempt claimed before sending.".into()
-            },
-        };
-        history.records.insert(slot.key.clone(), record.clone());
-        while history.records.len() > MAX_RECORDS {
-            history.records.pop_first();
-        }
-        settings_store::save(path, || Some(&history))?;
-        record
-    };
-    if initial.status == Status::Skipped {
-        return Ok(Some(initial));
-    }
-    let result = send();
-    let _lock = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut history = read_history(path)?;
-    let mut record = initial;
-    record.finished_at = Some(epoch());
-    match result {
-        Ok(done) => {
-            record.status = Status::Completed;
-            record.model = Some(done.model);
-            record.total_tokens = done.total_tokens;
-            record.detail =
-                "Model response completed. Quota window timing is controlled by the server.".into();
-        }
-        Err(error) => {
-            record.status = if error.cancelled {
-                Status::Cancelled
-            } else {
-                Status::Failed
-            };
-            record.detail = error.detail;
-            if let Some(seconds) = error.retry_after_secs {
-                history.blocked_until = history.blocked_until.max(epoch().saturating_add(seconds));
-            }
-        }
-    }
-    history.records.insert(slot.key.clone(), record.clone());
-    settings_store::save(path, || Some(history))?;
-    Ok(Some(record))
-}
-
 pub fn latest_summary(path: &Path, chinese: bool) -> String {
     let _lock = HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     match read_history(path) {
         Ok(history) => match history.records.last_key_value() {
             Some((_, record)) => {
                 let status = match (&record.status, chinese) {
+                    (Status::WaitingForReset, true) => "等待额度窗口重置",
+                    (Status::WaitingForReset, false) => "waiting for quota window reset",
+                    (Status::Completed, true)
+                        if record.verification == Verification::WindowStarted =>
+                    {
+                        "新窗口已确认"
+                    }
+                    (Status::Completed, false)
+                        if record.verification == Verification::WindowStarted =>
+                    {
+                        "new window confirmed"
+                    }
+                    (Status::Completed, true) if record.verification == Verification::Pending => {
+                        "请求完成，正在确认窗口"
+                    }
+                    (Status::Completed, false) if record.verification == Verification::Pending => {
+                        "request completed, checking window"
+                    }
+                    (Status::Completed, true)
+                        if matches!(
+                            record.verification,
+                            Verification::NotConfirmed | Verification::Unavailable
+                        ) =>
+                    {
+                        "请求完成，新窗口未确认"
+                    }
+                    (Status::Completed, false)
+                        if matches!(
+                            record.verification,
+                            Verification::NotConfirmed | Verification::Unavailable
+                        ) =>
+                    {
+                        "request completed, window unconfirmed"
+                    }
+                    (Status::Skipped, true)
+                        if record.verification == Verification::AlreadyActive =>
+                    {
+                        "已有新窗口，已跳过"
+                    }
+                    (Status::Skipped, false)
+                        if record.verification == Verification::AlreadyActive =>
+                    {
+                        "new window already active, skipped"
+                    }
                     (Status::Completed, true) => "请求完成",
                     (Status::Pending, true) => "进行中或上次中断",
                     (Status::Failed, true) => "失败",
@@ -309,7 +325,7 @@ pub fn latest_summary(path: &Path, chinese: bool) -> String {
                     (Status::Skipped, false) => "skipped",
                     (Status::Cancelled, false) => "cancelled",
                 };
-                format!(
+                let mut summary = format!(
                     "{}: {} — {status}{}",
                     if chinese {
                         "最近记录"
@@ -322,7 +338,31 @@ pub fn latest_summary(path: &Path, chinese: bool) -> String {
                         .as_ref()
                         .map(|m| format!(" ({m})"))
                         .unwrap_or_default()
-                )
+                );
+                if let Some(next) = record.next_check_at {
+                    summary.push_str(&format!(
+                        "\n{}: {}",
+                        if chinese {
+                            "下次检查"
+                        } else {
+                            "Next check"
+                        },
+                        format_epoch(next)
+                    ));
+                } else if record.verification == Verification::WindowStarted {
+                    if let Some(reset) = record.quota_after.as_ref().and_then(|q| q.reset_at) {
+                        summary.push_str(&format!(
+                            "\n{}: {}",
+                            if chinese {
+                                "窗口重置"
+                            } else {
+                                "Window resets"
+                            },
+                            format_epoch(reset)
+                        ));
+                    }
+                }
+                summary
             }
             None => {
                 if chinese {
@@ -342,6 +382,19 @@ pub fn latest_summary(path: &Path, chinese: bool) -> String {
     }
 }
 
+pub fn format_epoch(seconds: u64) -> String {
+    UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(seconds))
+        .and_then(native_interop::system_time_to_local)
+        .map(|time| {
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
+            )
+        })
+        .unwrap_or_else(|| seconds.to_string())
+}
+
 #[derive(Clone, Deserialize)]
 struct ReasoningLevel {
     effort: String,
@@ -358,7 +411,7 @@ struct Model {
     #[serde(default)]
     support_verbosity: bool,
 }
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 struct Catalog {
     #[serde(default)]
     client_version: String,
@@ -565,28 +618,104 @@ fn send_with(
     })
 }
 
-pub fn send(preferred: &str, permitted: impl Fn() -> bool) -> Result<Completed, Failure> {
-    if !permitted() {
-        return Err(Failure::cancelled());
+struct Client {
+    credentials: poller::CodexTokenData,
+    cache: Catalog,
+    agent: ureq::Agent,
+}
+
+impl Client {
+    fn load() -> Result<Self, Failure> {
+        let credentials = poller::read_codex_credentials()
+            .ok_or_else(|| Failure::new("No signed-in Codex account was found."))?;
+        let cache = poller::codex_auth_path()
+            .and_then(|p| p.parent().map(|d| d.join("models_cache.json")))
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<Catalog>(&b).ok())
+            .unwrap_or_default();
+        let agent = poller::build_agent()
+            .map_err(|_| Failure::new("Unable to initialize the configured proxy/TLS client."))?;
+        Ok(Self {
+            credentials,
+            cache,
+            agent,
+        })
     }
-    let credentials = poller::read_codex_credentials()
-        .ok_or_else(|| Failure::new("No signed-in Codex account was found."))?;
-    let cache = poller::codex_auth_path()
-        .and_then(|p| p.parent().map(|d| d.join("models_cache.json")))
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|b| serde_json::from_slice::<Catalog>(&b).ok())
-        .unwrap_or_default();
-    let agent = poller::build_agent()
-        .map_err(|_| Failure::new("Unable to initialize the configured proxy/TLS client."))?;
-    send_with(
-        &agent,
-        BASE_URL,
-        &credentials.access_token,
-        credentials.account_id.as_deref(),
-        cache,
-        preferred,
-        permitted,
-    )
+
+    fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let account = self
+            .credentials
+            .account_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .unwrap_or(&self.credentials.access_token);
+        format!("{:x}", Sha256::digest(account.as_bytes()))
+    }
+
+    fn quota(&self) -> Result<QuotaSnapshot, Failure> {
+        self.quota_at(QUOTA_URL)
+    }
+
+    fn quota_at(&self, url: &str) -> Result<QuotaSnapshot, Failure> {
+        let response = auth_request(
+            &self.agent,
+            "GET",
+            url,
+            &self.credentials.access_token,
+            self.credentials.account_id.as_deref(),
+            FALLBACK_CLIENT_VERSION,
+        )
+        .call()
+        .map_err(transport_error)?;
+        let value: Value = serde_json::from_reader(response.into_reader().take(1024 * 1024))
+            .map_err(|_| Failure::new("Unable to read the Codex quota window."))?;
+        quota_snapshot(&value, epoch())
+    }
+
+    fn send(&self, preferred: &str, permitted: impl Fn() -> bool) -> Result<Completed, Failure> {
+        send_with(
+            &self.agent,
+            BASE_URL,
+            &self.credentials.access_token,
+            self.credentials.account_id.as_deref(),
+            self.cache.clone(),
+            preferred,
+            permitted,
+        )
+    }
+}
+
+fn quota_snapshot(value: &Value, now: u64) -> Result<QuotaSnapshot, Failure> {
+    let limits = value
+        .get("rate_limit")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Failure::new("The quota response has no rate-limit information."))?;
+    let primary = limits.get("primary_window").filter(|v| v.is_object());
+    let secondary = limits.get("secondary_window").filter(|v| v.is_object());
+    let window = [primary, secondary]
+        .into_iter()
+        .flatten()
+        .find(|v| v["limit_window_seconds"].as_u64() == Some(18_000))
+        .or_else(|| primary.filter(|v| v.get("limit_window_seconds").is_none_or(Value::is_null)));
+    let Some(window) = window else {
+        return Ok(QuotaSnapshot {
+            checked_at: now,
+            reset_at: None,
+            window_seconds: None,
+            used_percent: None,
+        });
+    };
+    let reset = window
+        .get("reset_at")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| Failure::new("The five-hour quota window has an invalid reset time."))?;
+    Ok(QuotaSnapshot {
+        checked_at: now,
+        reset_at: (reset > 0).then_some(reset as u64),
+        window_seconds: Some(18_000),
+        used_percent: window["used_percent"].as_f64(),
+    })
 }
 
 #[cfg(test)]
@@ -595,10 +724,6 @@ mod tests {
     use std::io::Write;
     use std::net::TcpListener;
     use windows::Win32::Foundation::SYSTEMTIME;
-
-    fn path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("codex-warmup-{}-{name}.json", std::process::id()))
-    }
 
     #[test]
     fn weekly_times_are_validated_and_deduplicated() {
@@ -643,86 +768,84 @@ mod tests {
     }
 
     #[test]
-    fn saved_claim_prevents_duplicates_and_restart_replays() {
-        let path = path("dedupe");
-        let _ = std::fs::remove_file(&path);
-        let slot = Slot {
-            key: "2026-10-29 07:00".into(),
-        };
-        let record = execute_once(&path, &slot, || {
-            Ok(Completed {
-                model: "test-model".into(),
-                total_tokens: Some(8),
-            })
-        })
-        .unwrap()
-        .unwrap();
-        assert_eq!(record.status, Status::Completed);
-        assert!(execute_once(&path, &slot, || panic!("duplicate inference"))
-            .unwrap()
-            .is_none());
-        let interrupted = Slot {
-            key: "2026-10-29 13:00".into(),
-        };
-        let _ = std::panic::catch_unwind(|| {
-            let _ = execute_once(&path, &interrupted, || {
-                panic!("simulated process termination")
-            });
-        });
-        assert!(
-            execute_once(&path, &interrupted, || panic!("interrupted slot replayed"))
-                .unwrap()
-                .is_none()
-        );
-        assert!(latest_summary(&path, false).contains("pending/interrupted"));
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn retry_after_blocks_later_slots_and_bad_history_fails_closed() {
-        let path = path("retry");
-        let _ = std::fs::remove_file(&path);
-        execute_once(
-            &path,
-            &Slot {
-                key: "2026-10-29 07:00".into(),
-            },
-            || {
-                Err(Failure {
-                    detail: "HTTP 429".into(),
-                    retry_after_secs: Some(3600),
-                    cancelled: false,
-                })
-            },
-        )
-        .unwrap();
-        let later = execute_once(
-            &path,
-            &Slot {
-                key: "2026-10-29 07:01".into(),
-            },
-            || panic!("rate limit bypassed"),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(later.status, Status::Skipped);
-        std::fs::write(&path, b"not json").unwrap();
-        assert!(execute_once(
-            &path,
-            &Slot {
-                key: "2026-10-29 19:00".into()
-            },
-            || panic!("untracked inference")
-        )
-        .is_err());
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn streaming_success_requires_a_completed_model_response() {
         assert_eq!(read_completed(b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"total_tokens\":9}}}\n\n".as_slice()).unwrap(), Some(9));
         assert!(read_completed(b"data: {\"type\":\"response.failed\"}\n".as_slice()).is_err());
         assert!(read_completed(b"data: [DONE]\n".as_slice()).is_err());
+    }
+
+    #[test]
+    fn quota_parser_uses_five_hour_duration_instead_of_weekly_position_or_zero_percent() {
+        let value = json!({"rate_limit": {
+            "primary_window": {"used_percent":55,"reset_at":50_000,"limit_window_seconds":604_800},
+            "secondary_window": {"used_percent":0,"reset_at":1100,"limit_window_seconds":18_000}
+        }});
+        let quota = quota_snapshot(&value, 1000).unwrap();
+        assert_eq!(quota.reset_at, Some(1100));
+        assert_eq!(quota.used_percent, Some(0.0));
+        let weekly_only = json!({"rate_limit":{"primary_window":{"used_percent":55,"reset_at":50_000,"limit_window_seconds":604_800}}});
+        assert_eq!(quota_snapshot(&weekly_only, 1000).unwrap().reset_at, None);
+        let legacy = json!({"rate_limit":{"primary_window":{"used_percent":0,"reset_at":1100}}});
+        assert_eq!(quota_snapshot(&legacy, 1000).unwrap().reset_at, Some(1100));
+        assert!(quota_snapshot(&json!({"rate_limit":null}), 1000).is_err());
+        assert!(quota_snapshot(
+            &json!({"rate_limit":{"primary_window":{"reset_at":"invalid"}}}),
+            1000
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn quota_probe_is_an_authenticated_read_only_get_against_the_mock_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            assert_eq!(first, "GET /wham/usage HTTP/1.1\r\n");
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                headers.push_str(&line.to_ascii_lowercase());
+            }
+            assert!(headers.contains("authorization: bearer mock-token"));
+            assert!(headers.contains("chatgpt-account-id: mock-account"));
+            let body = r#"{"rate_limit":{"primary_window":{"used_percent":0,"reset_at":1100,"limit_window_seconds":18000}}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let client = Client {
+            credentials: poller::CodexTokenData {
+                access_token: "mock-token".into(),
+                account_id: Some("mock-account".into()),
+            },
+            cache: Catalog::default(),
+            agent: ureq::AgentBuilder::new()
+                .try_proxy_from_env(false)
+                .timeout(std::time::Duration::from_secs(3))
+                .build(),
+        };
+        assert_eq!(
+            client
+                .quota_at(&format!("http://{address}/wham/usage"))
+                .unwrap()
+                .reset_at,
+            Some(1100)
+        );
+        server.join().unwrap();
     }
 
     #[test]

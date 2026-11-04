@@ -1,5 +1,5 @@
 // Win32 styles: popup/caption/system menu, centered modal frame and dialog font.
-221 DIALOGEX 0, 0, 370, 340
+221 DIALOGEX 0, 0, 370, 356
 STYLE 0x80C808C0
 EXSTYLE 0x00040000
 CAPTION "Codex Usage - Weekly warm-up"
@@ -26,8 +26,8 @@ BEGIN
     LTEXT "Comma-separated HH:MM times. Leave a day blank to skip it.", 1205, 12, 214, 346, 12
     LTEXT "Model:", 1206, 12, 237, 45, 10
     EDITTEXT 1207, 62, 234, 296, 14, 0x00010080
-    LTEXT "No attempts yet.", 1208, 12, 259, 346, 26
-    LTEXT "Sends a real model request and uses quota. Missed times are not replayed.", 1209, 12, 290, 346, 20
-    DEFPUSHBUTTON "Save", 1, 228, 318, 62, 16, 0x00010000
-    PUSHBUTTON "Cancel", 2, 296, 318, 62, 16, 0x00010000
+    LTEXT "No attempts yet.", 1208, 12, 259, 346, 38
+    LTEXT "Waits for an active window to reset before using quota. Missed schedules are not replayed.", 1209, 12, 302, 346, 22
+    DEFPUSHBUTTON "Save", 1, 228, 334, 62, 16, 0x00010000
+    PUSHBUTTON "Cancel", 2, 296, 334, 62, 16, 0x00010000
 END

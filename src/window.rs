@@ -743,6 +743,9 @@ fn show_warmup_settings(hwnd: HWND) {
         );
         return;
     }
+    if let Err(error) = codex_warmup::cancel_deferred(&warmup_history_path()) {
+        diagnose::log_error("unable to cancel previous deferred warm-ups", error);
+    }
     unsafe {
         if settings.enabled {
             SetTimer(hwnd, TIMER_CODEX_WARMUP, 15_000, None);
@@ -763,25 +766,23 @@ fn start_scheduled_warmup(hwnd: SendHwnd) {
         let Some(s) = state.as_ref() else { return };
         (s.codex_warmup.clone(), s.proxy.clone())
     };
-    let Some(slot) = codex_warmup::current_slot(&settings) else {
+    if !settings.enabled {
         return;
-    };
+    }
+    let slot = codex_warmup::current_slot(&settings);
     let Some(guard) = codex_warmup::try_start() else {
         return;
     };
     let path = warmup_history_path();
     let spawn_result = std::thread::Builder::new().name("codex-scheduled-warmup".into()).spawn(move || {
         let _guard = guard;
-        let result = codex_warmup::execute_once(&path, &slot, || {
-            diagnose::log(format!("codex scheduled warm-up attempting slot={}", slot.key));
-            codex_warmup::send(&settings.model, || {
+        let result = codex_warmup::tick(&path, slot.as_ref(), &settings, || {
                 if !unsafe { IsWindow(hwnd.to_hwnd()).as_bool() } { return false; }
                 lock_state().as_ref().is_some_and(|s| s.codex_warmup.enabled && s.codex_warmup == settings && s.proxy == proxy_settings)
-            })
         });
         match result {
             Ok(Some(record)) => {
-                diagnose::log(format!("codex scheduled warm-up slot={} status={:?} model={:?} tokens={:?} detail={}", record.slot, record.status, record.model, record.total_tokens, record.detail));
+                diagnose::log(format!("codex scheduled warm-up slot={} status={:?} verification={:?} next_check={:?} model={:?} tokens={:?} detail={}", record.slot, record.status, record.verification, record.next_check_at.map(codex_warmup::format_epoch), record.model, record.total_tokens, record.detail));
                 if record.status == codex_warmup::Status::Completed && unsafe { IsWindow(hwnd.to_hwnd()).as_bool() } {
                     request_poll(hwnd, true);
                 }

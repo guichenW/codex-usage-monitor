@@ -43,8 +43,16 @@ pub fn log(message: impl AsRef<str>) {
         .unwrap_or(0);
 
     if let Ok(mut file) = state.file.lock() {
+        let local = crate::native_interop::system_time_to_local(SystemTime::now())
+            .map(|time| {
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
+                )
+            })
+            .unwrap_or_else(|| timestamp.to_string());
         let entry = format!(
-            "[{timestamp}] [pid={}] {}\n",
+            "[{local}] [unix={timestamp}] [pid={}] {}\n",
             std::process::id(),
             message.as_ref()
         );

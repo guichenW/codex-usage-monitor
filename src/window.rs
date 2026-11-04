@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -172,6 +172,7 @@ const IDM_APPEARANCE_RECOMMENDED: u16 = 99;
 const IDM_APPEARANCE_RESET: u16 = 100;
 const IDM_PROXY_SETTINGS: u16 = 101;
 const IDM_CODEX_WARMUP: u16 = 102;
+const IDM_RESTART: u16 = 103;
 const IDM_MONITOR_FIRST: u16 = 200;
 const MAX_MONITOR_MENU_ITEMS: usize = 100;
 
@@ -220,8 +221,84 @@ const ENV_RELAUNCH: &str = "CODEX_USAGE_RELAUNCH";
 /// Unix timestamp (seconds) of the relaunch that spawned this process, passed to
 /// the child so it can detect a relaunch storm.
 const ENV_LAST_RELAUNCH_UNIX: &str = "CODEX_USAGE_LAST_RELAUNCH_UNIX";
+static RELAUNCHING: AtomicBool = AtomicBool::new(false);
 
-/// Relaunch the widget as a fresh process after explorer.exe has restarted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelaunchReason {
+    Watchdog,
+    User,
+}
+
+fn restart_label(language: LanguageId) -> &'static str {
+    match language {
+        LanguageId::SimplifiedChinese => "重启",
+        LanguageId::TraditionalChinese => "重新啟動",
+        _ => "Restart",
+    }
+}
+
+fn relaunch_command(
+    executable: &std::path::Path,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    reason: RelaunchReason,
+    now: u64,
+) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = std::process::Command::new(executable);
+    command
+        .args(args)
+        .env(ENV_RELAUNCH, "1")
+        // A user-requested restart must not count as a shell crash loop.
+        .env(
+            ENV_LAST_RELAUNCH_UNIX,
+            if reason == RelaunchReason::Watchdog {
+                now
+            } else {
+                0
+            }
+            .to_string(),
+        )
+        .creation_flags(0x08000000); // CREATE_NO_WINDOW
+    command
+}
+
+fn spawn_relaunch(
+    command: &mut std::process::Command,
+    cleanup: impl FnOnce(),
+) -> std::io::Result<std::process::Child> {
+    // Keep the current process and its tray intact if the child cannot start.
+    let child = command.spawn()?;
+    cleanup();
+    Ok(child)
+}
+
+fn restart_from_menu(hwnd: HWND) {
+    let language = lock_state()
+        .as_ref()
+        .map(|s| s.language)
+        .unwrap_or(LanguageId::English);
+    if !save_state_settings() {
+        show_error_message(
+            hwnd,
+            restart_label(language),
+            if matches!(
+                language,
+                LanguageId::SimplifiedChinese | LanguageId::TraditionalChinese
+            ) {
+                "无法保存当前设置，重启已取消。"
+            } else {
+                "Unable to save current settings; restart cancelled."
+            },
+        );
+        return;
+    }
+    diagnose::log("user requested process restart");
+    if let Err(error) = relaunch_self(RelaunchReason::User) {
+        show_error_message(hwnd, restart_label(language), &error);
+    }
+}
+
+/// Relaunch as a fresh process after a shell restart or an explicit menu action.
 ///
 /// When the shell restarts it destroys our embedded child window outright (the
 /// window is gone, not merely orphaned - `IsWindow` returns false) and leaves
@@ -230,35 +307,33 @@ const ENV_LAST_RELAUNCH_UNIX: &str = "CODEX_USAGE_LAST_RELAUNCH_UNIX";
 /// taskbar - and exiting this one is the robust recovery. The child is flagged
 /// via `ENV_RELAUNCH` so it waits for this instance's single-instance mutex to
 /// be released before taking over (see the guard in `run`).
-fn relaunch_self() {
-    // Back off if we are relaunching very soon after the relaunch that spawned
-    // us: that signals the shell is crash-looping, not a one-off restart.
-    let now = now_unix_secs();
-    let last = std::env::var(ENV_LAST_RELAUNCH_UNIX)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    if last != 0 && now.saturating_sub(last) < RELAUNCH_THROTTLE_SECS {
-        diagnose::log("relaunch storm detected; backing off before relaunching");
-        std::thread::sleep(Duration::from_secs(RELAUNCH_BACKOFF_SECS));
-    }
-
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            diagnose::log_error("watchdog: unable to resolve current executable", error);
-            return;
-        }
-    };
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match std::process::Command::new(exe)
-        .args(&args)
-        .env(ENV_RELAUNCH, "1")
-        .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
-        .spawn()
+fn relaunch_self(reason: RelaunchReason) -> Result<(), String> {
+    if RELAUNCHING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
-        Ok(child) => {
+        return Ok(());
+    }
+    let result = (|| {
+        // Back off if we are relaunching very soon after the relaunch that spawned
+        // us: that signals the shell is crash-looping, not a one-off restart.
+        let now = now_unix_secs();
+        let last = std::env::var(ENV_LAST_RELAUNCH_UNIX)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if reason == RelaunchReason::Watchdog
+            && last != 0
+            && now.saturating_sub(last) < RELAUNCH_THROTTLE_SECS
+        {
+            diagnose::log("relaunch storm detected; backing off before relaunching");
+            std::thread::sleep(Duration::from_secs(RELAUNCH_BACKOFF_SECS));
+        }
+
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("Unable to resolve current executable: {error}"))?;
+        let mut command = relaunch_command(&exe, std::env::args_os().skip(1), reason, now);
+        let child = spawn_relaunch(&mut command, || {
             let hwnd = {
                 let state = lock_state();
                 state.as_ref().map(|s| s.hwnd.to_hwnd())
@@ -268,16 +343,26 @@ fn relaunch_self() {
                 // HWND even if Explorer has already destroyed that window.
                 tray_icon::remove_all(hwnd);
             }
-            diagnose::log(format!(
-                "watchdog: relaunched pid={}, tray cleanup attempted, exiting old instance",
-                child.id()
-            ));
-            std::process::exit(0);
-        }
-        Err(error) => {
-            diagnose::log_error("watchdog: unable to spawn relaunched instance", error);
-        }
+        })
+        .map_err(|error| {
+            format!("Unable to start a new process; current instance remains running: {error}")
+        })?;
+        diagnose::log(format!(
+            "{}: relaunched pid={}, tray cleanup attempted, exiting old instance",
+            if reason == RelaunchReason::User {
+                "manual restart"
+            } else {
+                "watchdog"
+            },
+            child.id()
+        ));
+        std::process::exit(0);
+    })();
+    RELAUNCHING.store(false, Ordering::Release);
+    if let Err(error) = &result {
+        diagnose::log_error("process relaunch failed", error);
     }
+    result
 }
 
 /// Detect explorer.exe restarts and recover from them.
@@ -304,7 +389,7 @@ fn spawn_taskbar_watchdog() {
                 "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
                 old.0, new.0
             ));
-            relaunch_self();
+            let _ = relaunch_self(RelaunchReason::Watchdog);
         }
     });
 }
@@ -2051,7 +2136,7 @@ pub fn run() {
     diagnose::log("window::run started");
 
     // Single-instance guard: silently exit if another instance is running.
-    // Exception: when relaunched after an explorer restart (ENV_RELAUNCH set),
+    // Exception: for watchdog and menu relaunches (ENV_RELAUNCH set),
     // wait for the previous instance to release the mutex, then take over.
     let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
     let mutex_name = native_interop::wide_str("Global\\CodexUsage");
@@ -3592,6 +3677,7 @@ unsafe extern "system" fn wnd_proc(
                 IDM_CODEX_WARMUP => {
                     show_warmup_settings(hwnd);
                 }
+                IDM_RESTART => restart_from_menu(hwnd),
                 1 => {
                     {
                         let mut state = lock_state();
@@ -4585,6 +4671,14 @@ fn show_context_menu(hwnd: HWND) {
 
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
+        let restart_str = native_interop::wide_str(restart_label(language));
+        let _ = AppendMenuW(
+            menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_RESTART as usize,
+            PCWSTR::from_raw(restart_str.as_ptr()),
+        );
+
         let exit_str = native_interop::wide_str(strings.exit);
         let _ = AppendMenuW(
             menu,
@@ -4949,6 +5043,114 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_keeps_diagnostic_arguments_and_separates_manual_from_watchdog_backoff() {
+        let exe = std::path::Path::new("C:\\Test Folder\\codex-usage.exe");
+        let args: Vec<std::ffi::OsString> = vec!["--diagnose".into()];
+        for (reason, expected_time) in [
+            (RelaunchReason::User, "0"),
+            (RelaunchReason::Watchdog, "1234"),
+        ] {
+            let command = relaunch_command(exe, args.clone(), reason, 1234);
+            assert_eq!(command.get_program(), exe.as_os_str());
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                args.iter().map(|v| v.as_os_str()).collect::<Vec<_>>()
+            );
+            let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+            assert_eq!(
+                env[std::ffi::OsStr::new(ENV_RELAUNCH)],
+                Some(std::ffi::OsStr::new("1"))
+            );
+            assert_eq!(
+                env[std::ffi::OsStr::new(ENV_LAST_RELAUNCH_UNIX)],
+                Some(std::ffi::OsStr::new(expected_time))
+            );
+        }
+    }
+
+    #[test]
+    fn restart_spawn_failure_does_not_begin_current_instance_cleanup() {
+        let missing =
+            std::env::temp_dir().join(format!("missing-codex-restart-{}.exe", std::process::id()));
+        assert!(!missing.exists());
+        let mut command = relaunch_command(&missing, Vec::new(), RelaunchReason::User, 0);
+        let mut cleaned = false;
+        assert!(spawn_relaunch(&mut command, || cleaned = true).is_err());
+        assert!(!cleaned);
+    }
+
+    // Runs only as a child of the mutex-handover test; never uses the live app's mutex.
+    #[test]
+    fn restart_mutex_probe() {
+        let Ok(name) = std::env::var("CODEX_USAGE_RESTART_TEST_MUTEX") else {
+            return;
+        };
+        use windows::Win32::System::Threading::{CreateEventW, ReleaseMutex, SetEvent};
+        unsafe {
+            let name_wide = native_interop::wide_str(&name);
+            let ready_wide = native_interop::wide_str(&format!("{name}-ready"));
+            let acquired_wide = native_interop::wide_str(&format!("{name}-acquired"));
+            let mutex = CreateMutexW(None, false, PCWSTR(name_wide.as_ptr())).unwrap();
+            let ready = CreateEventW(None, true, false, PCWSTR(ready_wide.as_ptr())).unwrap();
+            let acquired = CreateEventW(None, true, false, PCWSTR(acquired_wide.as_ptr())).unwrap();
+            assert_eq!(std::env::var(ENV_RELAUNCH).unwrap(), "1");
+            SetEvent(ready).unwrap();
+            let result = WaitForSingleObject(mutex, 3000);
+            assert!(result == WAIT_OBJECT_0 || result == WAIT_ABANDONED);
+            SetEvent(acquired).unwrap();
+            ReleaseMutex(mutex).unwrap();
+            CloseHandle(mutex).unwrap();
+            CloseHandle(ready).unwrap();
+            CloseHandle(acquired).unwrap();
+        }
+    }
+
+    #[test]
+    fn restart_child_waits_until_the_previous_instance_releases_its_mutex() {
+        use windows::Win32::System::Threading::{CreateEventW, ReleaseMutex};
+        let name = format!("Local\\CodexUsageRestartTest-{}", std::process::id());
+        unsafe {
+            let name_wide = native_interop::wide_str(&name);
+            let ready_wide = native_interop::wide_str(&format!("{name}-ready"));
+            let acquired_wide = native_interop::wide_str(&format!("{name}-acquired"));
+            let mutex = CreateMutexW(None, true, PCWSTR(name_wide.as_ptr())).unwrap();
+            let ready = CreateEventW(None, true, false, PCWSTR(ready_wide.as_ptr())).unwrap();
+            let acquired = CreateEventW(None, true, false, PCWSTR(acquired_wide.as_ptr())).unwrap();
+            let mut command = relaunch_command(
+                &std::env::current_exe().unwrap(),
+                [
+                    "--exact",
+                    "window::tests::restart_mutex_probe",
+                    "--nocapture",
+                ]
+                .map(std::ffi::OsString::from),
+                RelaunchReason::User,
+                0,
+            );
+            command
+                .env("CODEX_USAGE_RESTART_TEST_MUTEX", &name)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let child = spawn_relaunch(&mut command, || {
+                assert_eq!(WaitForSingleObject(ready, 3000), WAIT_OBJECT_0);
+                assert_eq!(WaitForSingleObject(acquired, 0), WAIT_TIMEOUT);
+                ReleaseMutex(mutex).unwrap();
+            })
+            .unwrap();
+            assert_eq!(WaitForSingleObject(acquired, 3000), WAIT_OBJECT_0);
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            CloseHandle(mutex).unwrap();
+            CloseHandle(ready).unwrap();
+            CloseHandle(acquired).unwrap();
+        }
+    }
 
     #[test]
     fn unavailable_quota_has_no_bar_fill() {

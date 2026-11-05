@@ -7,6 +7,62 @@ const MAX_WAIT: u64 = 6 * 60 * 60;
 const CHECK_RETRY: u64 = 30;
 const VERIFY_RETRY: u64 = 15;
 const MAX_VERIFICATIONS: u8 = 4;
+const WINDOW_CHECK_VERSION: u8 = 1;
+const PROBE_DELAY: u64 = 15;
+const RESET_JITTER: u64 = 3;
+const FULL_WINDOW_SLACK: u64 = 120;
+
+#[derive(Debug, PartialEq, Eq)]
+enum WindowCheck {
+    Idle,
+    Active,
+    Probe,
+}
+
+// An unused account may report reset_at = query time + five hours. One read
+// cannot distinguish it from a newly started window rounded down to zero use.
+fn full_unused_window(quota: &QuotaSnapshot) -> bool {
+    quota.used_percent == Some(0.0)
+        && quota.window_seconds.is_some_and(|span| {
+            span == 18_000
+                && quota.reset_at.is_some_and(|reset| {
+                    reset.saturating_sub(quota.checked_at).abs_diff(span) <= FULL_WINDOW_SLACK
+                })
+        })
+}
+
+fn stable_reset(previous: &QuotaSnapshot, current: &QuotaSnapshot) -> bool {
+    current.checked_at.saturating_sub(previous.checked_at) >= PROBE_DELAY
+        && previous
+            .reset_at
+            .zip(current.reset_at)
+            .is_some_and(|(a, b)| a.abs_diff(b) <= RESET_JITTER)
+}
+
+fn window_check(quota: &QuotaSnapshot, previous: Option<&QuotaSnapshot>) -> WindowCheck {
+    if quota.reset_at.is_none_or(|reset| reset <= quota.checked_at) {
+        return WindowCheck::Idle;
+    }
+    if !full_unused_window(quota) {
+        return WindowCheck::Active;
+    }
+    let Some(previous) = previous.filter(|q| full_unused_window(q)) else {
+        return WindowCheck::Probe;
+    };
+    if stable_reset(previous, quota) {
+        return WindowCheck::Active;
+    }
+    let elapsed = quota.checked_at.saturating_sub(previous.checked_at);
+    let drift = i128::from(quota.reset_at.unwrap()) - i128::from(previous.reset_at.unwrap());
+    if elapsed >= PROBE_DELAY
+        && drift > i128::from(RESET_JITTER)
+        && (drift - i128::from(elapsed)).abs() <= i128::from(RESET_JITTER)
+    {
+        WindowCheck::Idle
+    } else {
+        WindowCheck::Probe
+    }
+}
 
 trait Backend {
     fn now(&self) -> u64;
@@ -74,6 +130,9 @@ fn waiting_record(slot: &Slot, settings: &Settings, now: u64) -> Record {
         request_started_at: None,
         quota_before: None,
         quota_after: None,
+        quota_probe: None,
+        before_window_idle: false,
+        window_check_version: WINDOW_CHECK_VERSION,
         verification: Verification::NotChecked,
         verification_attempts: 0,
         quota_check_failures: 0,
@@ -151,6 +210,17 @@ fn prepare(
                 now,
                 "Deferred job expired after six hours; no late request was sent.",
             );
+            changed = true;
+        } else if record.status == Status::WaitingForReset
+            && record.window_check_version < WINDOW_CHECK_VERSION
+            && record.request_started_at.is_none()
+        {
+            // v4/v5 could postpone an idle placeholder for five hours. Recheck
+            // unsent jobs now; never reopen a claimed, failed or completed POST.
+            record.window_check_version = WINDOW_CHECK_VERSION;
+            record.quota_probe = None;
+            record.next_check_at = Some(now);
+            record.detail = "Rechecking an unsent job with corrected idle-window detection.".into();
             changed = true;
         }
     }
@@ -277,11 +347,14 @@ fn verify(record: &mut Record, backend: &mut impl Backend) -> Option<u64> {
                 .as_ref()
                 .and_then(|q| q.reset_at)
                 .unwrap_or(0);
-            let confirmed = after.reset_at.is_some_and(|reset| {
-                reset > now
-                    && reset > previous_reset.saturating_add(60)
-                    && previous_reset <= record.request_started_at.unwrap_or(0)
-            });
+            let active = window_check(&after, record.quota_after.as_ref()) == WindowCheck::Active;
+            let confirmed = active
+                && after.reset_at.is_some_and(|reset| {
+                    reset > now
+                        && (record.before_window_idle
+                            || (reset > previous_reset.saturating_add(60)
+                                && previous_reset <= record.request_started_at.unwrap_or(0)))
+                });
             record.quota_after = Some(after);
             if confirmed {
                 record.verification = Verification::WindowStarted;
@@ -384,12 +457,39 @@ fn tick_with(
         return Ok(Some(record));
     }
     let now = backend.now();
-    if let Some(reset) = before.reset_at.filter(|reset| *reset > now) {
+    let classification = window_check(&before, record.quota_probe.as_ref());
+    if classification == WindowCheck::Probe {
+        let prior_probe = record.quota_probe.replace(before.clone());
+        record.quota_before = Some(before);
+        if prior_probe.is_some() {
+            let blocked = quota_failure(
+                &mut record,
+                Failure::new(
+                    "Quota window state is ambiguous; only the read-only probe will be retried.",
+                ),
+                now,
+            );
+            store(path, &record, blocked)?;
+        } else {
+            wait_for(&mut record, now.saturating_add(PROBE_DELAY), "Zero use and a full-window reset may be an idle placeholder; checking whether its reset moves.", now);
+            store(path, &record, None)?;
+        }
+        return Ok(Some(record));
+    }
+    record.quota_probe = None;
+    if classification == WindowCheck::Active {
+        let reset = before.reset_at.unwrap();
         let renewed = record
             .quota_before
             .as_ref()
             .and_then(|q| q.reset_at)
-            .is_some_and(|old| old <= now && reset > old.saturating_add(60));
+            .is_some_and(|old| old <= now && reset > old.saturating_add(60))
+            || record.quota_before.as_ref().is_some_and(|old| {
+                full_unused_window(old)
+                    && old
+                        .reset_at
+                        .is_some_and(|old_reset| reset > old_reset.saturating_add(RESET_JITTER))
+            });
         record.quota_after = Some(before.clone());
         if renewed {
             record.verification = Verification::AlreadyActive;
@@ -412,7 +512,9 @@ fn tick_with(
         store(path, &record, None)?;
         return Ok(Some(record));
     }
+    record.before_window_idle = true;
     record.quota_before = Some(before);
+    record.quota_after = None;
     record.status = Status::Pending;
     record.next_check_at = None;
     record.request_started_at = Some(now);
@@ -538,8 +640,17 @@ mod tests {
                 checked_at: self.now,
                 reset_at: reset,
                 window_seconds: Some(18_000),
-                used_percent: Some(0.0),
+                used_percent: Some(if reset.is_some() { 1.0 } else { 0.0 }),
             }));
+        }
+        fn zero_snapshot(&mut self, reset: Option<u64>) {
+            self.snapshot(reset);
+            self.quotas
+                .back_mut()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .used_percent = Some(0.0);
         }
         fn error(&mut self) {
             self.quotas
@@ -557,7 +668,11 @@ mod tests {
             if let Some(callback) = &mut self.on_quota {
                 callback();
             }
-            self.quotas.pop_front().expect("unexpected quota request")
+            let mut result = self.quotas.pop_front().expect("unexpected quota request");
+            if let Ok(quota) = &mut result {
+                quota.checked_at = self.now;
+            }
+            result
         }
         fn send(&mut self) -> Result<Completed, Failure> {
             self.posts += 1;
@@ -592,7 +707,7 @@ mod tests {
         let slot = slot();
         let mut backend = Fake::new(1_793_739_901); // 05:05:01 +08:00
         let old_reset = 1_793_740_656; // 05:17:36
-        backend.snapshot(Some(old_reset));
+        backend.zero_snapshot(Some(old_reset));
         let record = tick_with(&file.0, Some(&slot), &settings, &|| true, &mut backend)
             .unwrap()
             .unwrap();
@@ -971,5 +1086,223 @@ mod tests {
                 .is_none()
         );
         assert_eq!(backend.posts, 0);
+    }
+
+    #[test]
+    fn nov5_idle_placeholder_is_probed_then_sent_and_zero_use_fixed_reset_is_verified() {
+        let file = TestFile::new();
+        let today = Slot {
+            key: "2026-11-05 05:05".into(),
+        };
+        let mut backend = Fake::new(1_793_826_312); // Actual 05:05:12 observation.
+        backend.zero_snapshot(Some(backend.now + 18_000));
+        let first = tick_with(&file.0, Some(&today), &settings(), &|| true, &mut backend)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.next_check_at, Some(backend.now + PROBE_DELAY));
+        assert!(first.quota_probe.is_some());
+        assert_eq!(backend.posts, 0);
+        assert!(latest_summary(&file.0, true).contains("正在确认窗口是否空闲"));
+
+        // A restart continues the saved probe. The idle estimate follows time.
+        let mut resumed = Fake::new(backend.now + PROBE_DELAY);
+        let real_reset = resumed.now + 18_000;
+        resumed.zero_snapshot(Some(real_reset));
+        resumed.zero_snapshot(Some(real_reset));
+        let sent = tick_with(&file.0, None, &settings(), &|| true, &mut resumed)
+            .unwrap()
+            .unwrap();
+        assert!(sent.before_window_idle);
+        assert_eq!(sent.request_started_at, Some(resumed.now));
+        assert_eq!(sent.verification, Verification::Pending);
+        assert_eq!(resumed.posts, 1);
+
+        // A real tiny request can still round to zero: the reset now stays fixed.
+        resumed.now += PROBE_DELAY;
+        resumed.zero_snapshot(Some(real_reset));
+        let verified = tick_with(&file.0, None, &settings(), &|| true, &mut resumed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified.verification, Verification::WindowStarted);
+        assert_eq!(resumed.posts, 1);
+        assert!(
+            tick_with(&file.0, Some(&today), &settings(), &|| true, &mut resumed)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_just_started_window_rounded_to_zero_is_not_mistaken_for_idle() {
+        let file = TestFile::new();
+        let mut backend = Fake::new(1000);
+        backend.zero_snapshot(Some(19_000));
+        tick_with(&file.0, Some(&slot()), &settings(), &|| true, &mut backend).unwrap();
+        backend.now += PROBE_DELAY;
+        backend.zero_snapshot(Some(19_001)); // One-second server rounding jitter.
+        let waiting = tick_with(&file.0, None, &settings(), &|| true, &mut backend)
+            .unwrap()
+            .unwrap();
+        assert_eq!(waiting.next_check_at, Some(19_001 + RESET_GRACE));
+        assert!(waiting.quota_probe.is_none());
+        assert_eq!(backend.posts, 0);
+    }
+
+    #[test]
+    fn positive_use_needs_no_idle_probe_even_with_a_full_window_remaining() {
+        let file = TestFile::new();
+        let mut backend = Fake::new(1000);
+        backend.snapshot(Some(19_000));
+        let waiting = tick_with(&file.0, Some(&slot()), &settings(), &|| true, &mut backend)
+            .unwrap()
+            .unwrap();
+        assert_eq!(waiting.next_check_at, Some(19_005));
+        assert!(waiting.quota_probe.is_none());
+        assert_eq!(backend.posts, 0);
+    }
+
+    #[test]
+    fn moving_estimates_after_a_completed_post_do_not_confirm_a_window_or_repeat_inference() {
+        let file = TestFile::new();
+        let mut backend = Fake::new(1000);
+        backend.snapshot(None);
+        for number in 0..MAX_VERIFICATIONS {
+            backend.now = 1000 + number as u64 * VERIFY_RETRY;
+            backend.zero_snapshot(Some(backend.now + 18_000));
+            let current_slot = slot();
+            tick_with(
+                &file.0,
+                if number == 0 {
+                    Some(&current_slot)
+                } else {
+                    None
+                },
+                &settings(),
+                &|| true,
+                &mut backend,
+            )
+            .unwrap();
+        }
+        let record = file.record(&slot().key);
+        assert_eq!(record.status, Status::Completed);
+        assert_eq!(record.verification, Verification::NotConfirmed);
+        assert_eq!(backend.posts, 1);
+        assert!(record.next_check_at.is_none());
+    }
+
+    fn old_waiting(file: &TestFile, now: u64) {
+        let mut record = waiting_record(&slot(), &settings(), now);
+        record.window_check_version = 0;
+        record.quota_before = Some(QuotaSnapshot {
+            checked_at: now,
+            reset_at: Some(now + 18_000),
+            window_seconds: Some(18_000),
+            used_percent: Some(0.0),
+        });
+        record.next_check_at = Some(now + 18_005);
+        let mut legacy = serde_json::to_value(History {
+            records: BTreeMap::from([(record.slot.clone(), record)]),
+            ..Default::default()
+        })
+        .unwrap();
+        for value in legacy["records"].as_object_mut().unwrap().values_mut() {
+            let object = value.as_object_mut().unwrap();
+            for field in ["window_check_version", "quota_probe", "before_window_idle"] {
+                object.remove(field); // Exact v5 shape: new fields did not exist.
+            }
+        }
+        settings_store::save(&file.0, || Some(legacy)).unwrap();
+    }
+
+    #[test]
+    fn upgrading_rechecks_unsent_v5_jobs_before_their_wrong_five_hour_deadline() {
+        let file = TestFile::new();
+        old_waiting(&file, 1000);
+        let mut backend = Fake::new(1060);
+        backend.zero_snapshot(Some(19_060));
+        let probe = tick_with(&file.0, None, &settings(), &|| true, &mut backend)
+            .unwrap()
+            .unwrap();
+        assert_eq!(probe.next_check_at, Some(1075));
+        assert_eq!(probe.window_check_version, WINDOW_CHECK_VERSION);
+        backend.now = 1075;
+        backend.zero_snapshot(Some(19_075));
+        backend.snapshot(Some(19_075));
+        let record = tick_with(&file.0, None, &settings(), &|| true, &mut backend)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.verification, Verification::WindowStarted);
+        assert_eq!(backend.posts, 1);
+    }
+
+    #[test]
+    fn upgrading_skips_an_old_idle_job_if_other_activity_already_started_the_window() {
+        let file = TestFile::new();
+        old_waiting(&file, 1000);
+        let mut backend = Fake::new(2000);
+        backend.snapshot(Some(20_000));
+        let record = tick_with(&file.0, None, &settings(), &|| true, &mut backend)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, Status::Skipped);
+        assert_eq!(record.verification, Verification::AlreadyActive);
+        assert_eq!(backend.posts, 0);
+    }
+
+    #[test]
+    fn upgrading_never_reopens_claimed_failed_or_completed_model_requests() {
+        for status in [Status::Pending, Status::Failed, Status::Completed] {
+            let file = TestFile::new();
+            old_waiting(&file, 1000);
+            let mut history = read_history(&file.0).unwrap();
+            let record = history.records.get_mut(&slot().key).unwrap();
+            record.status = status.clone();
+            record.request_started_at = Some(1001);
+            settings_store::save(&file.0, || Some(history)).unwrap();
+            let mut backend = Fake::new(1060);
+            assert!(
+                tick_with(&file.0, Some(&slot()), &settings(), &|| true, &mut backend)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(file.record(&slot().key).status, status);
+            assert_eq!(backend.posts, 0);
+        }
+    }
+
+    #[test]
+    fn an_inconsistent_zero_use_reset_is_rechecked_without_sending() {
+        let file = TestFile::new();
+        let mut backend = Fake::new(1000);
+        backend.zero_snapshot(Some(19_000));
+        tick_with(&file.0, Some(&slot()), &settings(), &|| true, &mut backend).unwrap();
+        backend.now += PROBE_DELAY;
+        backend.zero_snapshot(Some(19_060)); // Neither fixed nor following the 15s elapsed.
+        let record = tick_with(&file.0, None, &settings(), &|| true, &mut backend)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.next_check_at, Some(backend.now + CHECK_RETRY));
+        assert_eq!(record.quota_check_failures, 1);
+        assert_eq!(backend.posts, 0);
+    }
+
+    #[test]
+    fn a_failed_second_probe_only_retries_the_read_and_keeps_the_idle_baseline() {
+        let file = TestFile::new();
+        let mut backend = Fake::new(1000);
+        backend.zero_snapshot(Some(19_000));
+        tick_with(&file.0, Some(&slot()), &settings(), &|| true, &mut backend).unwrap();
+        backend.now += PROBE_DELAY;
+        backend.error();
+        tick_with(&file.0, None, &settings(), &|| true, &mut backend).unwrap();
+        assert_eq!(backend.posts, 0);
+        backend.now += CHECK_RETRY;
+        backend.zero_snapshot(Some(backend.now + 18_000));
+        backend.snapshot(Some(backend.now + 18_000));
+        let result = tick_with(&file.0, None, &settings(), &|| true, &mut backend)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.verification, Verification::WindowStarted);
+        assert_eq!(backend.posts, 1);
     }
 }

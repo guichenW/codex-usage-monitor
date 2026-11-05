@@ -53,6 +53,10 @@ Missed minutes are not replayed after startup, sleep or a clock jump. Deferred j
 
 After `response.completed`, the result and token count are saved before a quota verification GET. A new five-hour window is confirmed only when the server reports a future reset time advanced from the expired pre-request window. Delayed verification gets up to four read attempts; it never resends inference. The settings dialog distinguishes waiting, request completion, confirmed windows and unconfirmed results. History records the scheduled time, actual request time, next check, and quota snapshots before and after. Diagnostic logs also include readable local timestamps. Existing history remains readable and is not replayed.
 
+An idle account can report zero usage with a reset exactly five hours after the read, without a running window. For a zero-use reset within two minutes of a full five-hour span, save a probe and read again at least 15 seconds later. A reset following elapsed query time is idle; a reset fixed within three seconds of rounding jitter is active, even when tiny real usage still rounds to zero. Inconsistent samples retry only read-only checks. Quota GETs request no-cache. Post-request confirmation uses the same distinction: a moving estimate never proves activation, and a fixed zero-use window needs two spaced reads. An observed idle baseline does not need the post-request reset to advance beyond its previous placeholder value.
+
+Unsent v4/v5 deferred jobs are rechecked once on upgrade instead of waiting out their possibly incorrect five-hour deadline. Claimed, failed and completed model requests are never reopened by this migration. The schedule editor shows when it is checking whether a window is idle.
+
 This sends a real model request and consumes usage. It does not force a running server quota window to reset. The backend protocol can change; actual account access and activation require a live test. To test a schedule, temporarily set one time one or two minutes ahead, enable it, and inspect the history and quota display afterward.
 
 ## Update failures

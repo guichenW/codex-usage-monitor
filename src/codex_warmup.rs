@@ -197,6 +197,12 @@ pub struct Record {
     #[serde(default)]
     pub quota_after: Option<QuotaSnapshot>,
     #[serde(default)]
+    quota_probe: Option<QuotaSnapshot>,
+    #[serde(default)]
+    before_window_idle: bool,
+    #[serde(default)]
+    window_check_version: u8,
+    #[serde(default)]
     pub verification: Verification,
     #[serde(default)]
     verification_attempts: u8,
@@ -270,6 +276,12 @@ pub fn latest_summary(path: &Path, chinese: bool) -> String {
         Ok(history) => match history.records.last_key_value() {
             Some((_, record)) => {
                 let status = match (&record.status, chinese) {
+                    (Status::WaitingForReset, true) if record.quota_probe.is_some() => {
+                        "正在确认窗口是否空闲"
+                    }
+                    (Status::WaitingForReset, false) if record.quota_probe.is_some() => {
+                        "checking whether the window is idle"
+                    }
                     (Status::WaitingForReset, true) => "等待额度窗口重置",
                     (Status::WaitingForReset, false) => "waiting for quota window reset",
                     (Status::Completed, true)
@@ -666,6 +678,7 @@ impl Client {
             self.credentials.account_id.as_deref(),
             FALLBACK_CLIENT_VERSION,
         )
+        .set("Cache-Control", "no-cache")
         .call()
         .map_err(transport_error)?;
         let value: Value = serde_json::from_reader(response.into_reader().take(1024 * 1024))
@@ -710,11 +723,15 @@ fn quota_snapshot(value: &Value, now: u64) -> Result<QuotaSnapshot, Failure> {
         .get("reset_at")
         .and_then(Value::as_i64)
         .ok_or_else(|| Failure::new("The five-hour quota window has an invalid reset time."))?;
+    let used = window["used_percent"]
+        .as_f64()
+        .filter(|used| used.is_finite() && *used >= 0.0)
+        .ok_or_else(|| Failure::new("The five-hour quota window has invalid usage information."))?;
     Ok(QuotaSnapshot {
         checked_at: now,
         reset_at: (reset > 0).then_some(reset as u64),
         window_seconds: Some(18_000),
-        used_percent: window["used_percent"].as_f64(),
+        used_percent: Some(used),
     })
 }
 

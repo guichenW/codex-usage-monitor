@@ -3,7 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, FILETIME, HWND, LPARAM, RECT, SYSTEMTIME};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    EnumDisplayDevicesW, GetMonitorInfoW, MonitorFromWindow, DISPLAY_DEVICEW,
+    DISPLAY_DEVICE_ACTIVE, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONULL,
 };
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -60,14 +61,10 @@ pub struct TaskbarWindow {
 }
 
 /// Windows display device name (for example \\.\DISPLAY2) for a taskbar.
-/// Unlike enumeration order, this survives taskbar recreation and rearrangement.
+/// Use the actual taskbar window rather than a potentially stale appbar rect.
 pub fn taskbar_monitor_device(taskbar: &TaskbarWindow) -> Option<String> {
-    let point = windows::Win32::Foundation::POINT {
-        x: taskbar.rect.left + (taskbar.rect.right - taskbar.rect.left) / 2,
-        y: taskbar.rect.top + (taskbar.rect.bottom - taskbar.rect.top) / 2,
-    };
     unsafe {
-        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        let monitor = MonitorFromWindow(taskbar.hwnd, MONITOR_DEFAULTTONULL);
         if monitor.is_invalid() {
             return None;
         }
@@ -76,13 +73,44 @@ pub fn taskbar_monitor_device(taskbar: &TaskbarWindow) -> Option<String> {
         if !GetMonitorInfoW(monitor, &mut info as *mut _ as *mut MONITORINFO).as_bool() {
             return None;
         }
-        let len = info
-            .szDevice
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(info.szDevice.len());
-        Some(String::from_utf16_lossy(&info.szDevice[..len]))
+        display_string(&info.szDevice)
     }
+}
+
+fn display_string(value: &[u16]) -> Option<String> {
+    let end = value.iter().position(|&c| c == 0).unwrap_or(value.len());
+    (end != 0).then(|| String::from_utf16_lossy(&value[..end]))
+}
+
+/// The monitor interface can survive a change in the Windows DISPLAY number.
+/// A cloned display may have more than one active monitor on a single source.
+pub fn monitor_interface_name(device: &str) -> Option<String> {
+    let name = wide_str(device);
+    let mut interface = None;
+    for index in 0.. {
+        let mut monitor = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        let present = unsafe {
+            EnumDisplayDevicesW(
+                PCWSTR(name.as_ptr()),
+                index,
+                &mut monitor,
+                EDD_GET_DEVICE_INTERFACE_NAME,
+            )
+        };
+        if !present.as_bool() {
+            return interface;
+        }
+        if monitor.StateFlags & DISPLAY_DEVICE_ACTIVE != 0 {
+            if interface.is_some() {
+                return None;
+            }
+            interface = Some(display_string(&monitor.DeviceID)?);
+        }
+    }
+    None
 }
 
 pub fn find_taskbars() -> Vec<TaskbarWindow> {
@@ -174,8 +202,11 @@ pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
 }
 
 /// Embed our window as a child of the taskbar
-pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
+pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) -> bool {
     unsafe {
+        if !IsWindow(taskbar_hwnd).as_bool() {
+            return false;
+        }
         // Preserve existing extended style, add tool window + no activate
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
         // Reset alpha mode used by the startup popup fallback before switching
@@ -189,12 +220,26 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
             ex_style | WS_EX_TOOLWINDOW.0 as i32 | WS_EX_NOACTIVATE.0 as i32,
         );
 
-        // Change from popup to child
+        // Clear fallback popup alpha before reparenting so UpdateLayeredWindow works.
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let new_style = (style & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
-
         let _ = SetParent(hwnd, taskbar_hwnd);
+        // SetParent can return a null previous parent on success for a popup.
+        if GetParent(hwnd).ok() != Some(taskbar_hwnd) {
+            let _ = SetWindowLongW(hwnd, GWL_STYLE, style as i32);
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style);
+            if style & WS_POPUP_STYLE != 0 && ex_style & WS_EX_LAYERED.0 as i32 != 0 {
+                let _ = SetLayeredWindowAttributes(
+                    hwnd,
+                    windows::Win32::Foundation::COLORREF(0),
+                    255,
+                    LWA_ALPHA,
+                );
+            }
+            return false;
+        }
+        true
     }
 }
 
@@ -239,7 +284,7 @@ mod attachment_tests {
             )
             .unwrap();
             SetLayeredWindowAttributes(child, COLORREF(0), 255, LWA_ALPHA).unwrap();
-            embed_in_taskbar(child, parent);
+            assert!(embed_in_taskbar(child, parent));
             assert_eq!(GetParent(child).unwrap(), parent);
             let dc = CreateCompatibleDC(None);
             let info = BITMAPINFO {

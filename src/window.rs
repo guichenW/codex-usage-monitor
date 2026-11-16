@@ -104,6 +104,8 @@ struct AppState {
 
     taskbar_index: usize,
     monitor_device: Option<String>,
+    locked_monitor: Option<MonitorLock>,
+    waiting_for_locked_monitor: bool,
     tray_offset: i32,
     anchor_left: bool,
     dragging: bool,
@@ -173,6 +175,7 @@ const IDM_APPEARANCE_RESET: u16 = 100;
 const IDM_PROXY_SETTINGS: u16 = 101;
 const IDM_CODEX_WARMUP: u16 = 102;
 const IDM_RESTART: u16 = 103;
+const IDM_LOCK_MONITOR: u16 = 104;
 const IDM_MONITOR_FIRST: u16 = 200;
 const MAX_MONITOR_MENU_ITEMS: usize = 100;
 
@@ -183,6 +186,7 @@ const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 /// How often the watchdog thread polls for an explorer.exe restart (which
 /// recreates the taskbar and wipes our tray-icon registration).
 const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
+const TASKBAR_RETRY_INTERVAL_MS: u32 = 2_000;
 
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -384,6 +388,9 @@ fn spawn_taskbar_watchdog() {
         };
         let taskbars = native_interop::find_taskbars();
         if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
+            if lock_state().as_ref().and_then(|s| s.taskbar_hwnd) != Some(old) {
+                continue;
+            }
             let new = taskbars[0].hwnd;
             diagnose::log(format!(
                 "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
@@ -528,6 +535,31 @@ impl Appearance {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct MonitorLock {
+    device: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interface: Option<String>,
+}
+
+impl MonitorLock {
+    fn from_taskbar(taskbar: &native_interop::TaskbarWindow) -> Option<Self> {
+        let device = native_interop::taskbar_monitor_device(taskbar)?;
+        let interface = native_interop::monitor_interface_name(&device);
+        Some(Self { device, interface })
+    }
+
+    fn matches(&self, target: &Self) -> bool {
+        match self.interface.as_deref() {
+            Some(interface) => target
+                .interface
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(interface)),
+            None => self.device.eq_ignore_ascii_case(&target.device),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct SettingsFile {
     #[serde(default)]
     codex_warmup: codex_warmup::Settings,
@@ -541,6 +573,8 @@ struct SettingsFile {
     taskbar_index: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     monitor_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    locked_monitor: Option<MonitorLock>,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
     #[serde(default = "default_adaptive_refresh")]
@@ -578,6 +612,7 @@ impl Default for SettingsFile {
             anchor_left: false,
             taskbar_index: 0,
             monitor_device: None,
+            locked_monitor: None,
             poll_interval_ms: default_poll_interval(),
             adaptive_refresh: true,
             language: None,
@@ -715,6 +750,7 @@ fn save_state_settings() -> bool {
             anchor_left: s.anchor_left,
             taskbar_index: s.taskbar_index,
             monitor_device: s.monitor_device.clone(),
+            locked_monitor: s.locked_monitor.clone(),
             poll_interval_ms: s.poll_interval_ms,
             adaptive_refresh: s.adaptive_refresh,
             language: s
@@ -1137,40 +1173,41 @@ fn sync_tray_icons(hwnd: HWND) {
     tray_icon::sync(hwnd, icon.as_ref());
 }
 
-fn toggle_widget_visibility(hwnd: HWND) {
-    let new_visible = {
-        let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            s.widget_visible = !s.widget_visible;
-            s.widget_visible
-        } else {
-            return;
-        }
-    };
-    save_state_settings();
+fn sync_widget_visibility(hwnd: HWND) {
+    let visible = lock_state()
+        .as_ref()
+        .is_some_and(|s| s.widget_visible && !s.waiting_for_locked_monitor);
     unsafe {
-        if new_visible {
-            position_at_taskbar();
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            render_layered();
-        } else {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        }
+        let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
     }
 }
 
-fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
-    let taskbars = native_interop::find_taskbars();
-    if taskbars.is_empty() {
-        diagnose::log("taskbar not found; using fallback popup window");
+fn toggle_widget_visibility(hwnd: HWND) {
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.widget_visible = !s.widget_visible;
+        } else {
+            return;
+        }
+    }
+    save_state_settings();
+    update_taskbar_tracking(hwnd);
+    position_at_taskbar();
+    sync_widget_visibility(hwnd);
+    render_layered();
+}
+
+fn attach_to_taskbar(hwnd: HWND, index: usize, taskbar: native_interop::TaskbarWindow) -> bool {
+    if !native_interop::embed_in_taskbar(hwnd, taskbar.hwnd) {
+        diagnose::log(format!("taskbar attachment failed hwnd={:?}", taskbar.hwnd));
         return false;
     }
 
-    let index = requested_index.min(taskbars.len().saturating_sub(1));
-    let taskbar = taskbars[index];
     diagnose::log(format!(
-        "taskbar selected index={index} count={} hwnd={:?} rect=({}, {}, {}, {})",
-        taskbars.len(),
+        "taskbar selected index={index} device={:?} primary={} hwnd={:?} rect=({}, {}, {}, {})",
+        native_interop::taskbar_monitor_device(&taskbar),
+        taskbar.is_primary,
         taskbar.hwnd,
         taskbar.rect.left,
         taskbar.rect.top,
@@ -1186,8 +1223,6 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         native_interop::unhook_win_event(hook);
     }
 
-    native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
-
     let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
     if tray_notify.is_some() {
         diagnose::log("TrayNotifyWnd found");
@@ -1195,10 +1230,8 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         diagnose::log("TrayNotifyWnd not found");
     }
 
-    let hook = tray_notify.and_then(|tray_hwnd| {
-        let thread_id = native_interop::get_window_thread_id(tray_hwnd);
-        native_interop::set_tray_event_hook(thread_id, on_tray_location_changed)
-    });
+    let thread_id = native_interop::get_window_thread_id(tray_notify.unwrap_or(taskbar.hwnd));
+    let hook = native_interop::set_tray_event_hook(thread_id, on_taskbar_location_changed);
     if hook.is_some() {
         diagnose::log("tray event hook installed");
     } else {
@@ -1220,37 +1253,182 @@ fn preferred_taskbar_index(
     taskbars: &[native_interop::TaskbarWindow],
     monitor_device: Option<&str>,
     legacy_index: usize,
-) -> usize {
-    match monitor_device {
-        Some(device) => taskbars
-            .iter()
-            .position(|taskbar| {
-                native_interop::taskbar_monitor_device(taskbar).as_deref() == Some(device)
-            })
-            .unwrap_or_else(|| {
-                taskbars
-                    .iter()
-                    .position(|taskbar| taskbar.is_primary)
-                    .unwrap_or(0)
-            }),
-        None => legacy_index.min(taskbars.len().saturating_sub(1)),
+    locked: Option<&MonitorLock>,
+    mut monitor_for: impl FnMut(&native_interop::TaskbarWindow) -> Option<MonitorLock>,
+) -> Option<usize> {
+    if let Some(locked) = locked {
+        return taskbars.iter().position(|taskbar| {
+            monitor_for(taskbar).is_some_and(|target| locked.matches(&target))
+        });
+    }
+    if let Some(device) = monitor_device {
+        if let Some(index) = taskbars.iter().position(|taskbar| {
+            monitor_for(taskbar).is_some_and(|target| target.device.eq_ignore_ascii_case(device))
+        }) {
+            return Some(index);
+        }
+    } else if legacy_index > 0 && legacy_index < taskbars.len() {
+        return Some(legacy_index);
+    }
+    taskbars.iter().position(|taskbar| taskbar.is_primary)
+}
+
+fn refresh_taskbar_selection(hwnd: HWND) -> bool {
+    let (preferred, legacy_index, current, locked) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return false;
+        };
+        (
+            s.monitor_device.clone(),
+            s.taskbar_index,
+            s.taskbar_hwnd,
+            s.locked_monitor.clone(),
+        )
+    };
+    let taskbars = native_interop::find_taskbars();
+    let selected = preferred_taskbar_index(
+        &taskbars,
+        preferred.as_deref(),
+        legacy_index,
+        locked.as_ref(),
+        MonitorLock::from_taskbar,
+    );
+    let mut reattached = false;
+    let ready = selected.is_some_and(|index| {
+        let taskbar = taskbars[index];
+        if current == Some(taskbar.hwnd) && unsafe { GetParent(hwnd).ok() } == current {
+            return true;
+        }
+        if locked.is_some() {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+        reattached = attach_to_taskbar(hwnd, index, taskbar);
+        reattached
+    });
+    let waiting = locked.is_some() && !ready;
+    let waiting_changed = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return false;
+        };
+        let changed = s.waiting_for_locked_monitor != waiting;
+        s.waiting_for_locked_monitor = waiting;
+        changed
+    };
+    if waiting_changed && waiting {
+        diagnose::log(format!(
+            "locked monitor unavailable; hiding widget until it returns: {:?}",
+            locked.as_ref().map(|target| &target.device)
+        ));
+        sync_widget_visibility(hwnd);
+    } else if ready && (reattached || waiting_changed) {
+        position_at_taskbar();
+        sync_widget_visibility(hwnd);
+        render_layered();
+    } else if waiting_changed {
+        sync_widget_visibility(hwnd);
+    }
+    ready
+}
+
+fn taskbar_tracking_needed(ready: bool) -> bool {
+    !ready
+        || lock_state()
+            .as_ref()
+            .is_some_and(|s| s.locked_monitor.is_some())
+}
+
+fn update_taskbar_tracking(hwnd: HWND) -> bool {
+    let ready = refresh_taskbar_selection(hwnd);
+    unsafe {
+        if taskbar_tracking_needed(ready) {
+            SetTimer(hwnd, TIMER_TASKBAR_RETRY, TASKBAR_RETRY_INTERVAL_MS, None);
+        } else {
+            let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
+        }
+    }
+    ready
+}
+
+fn monitor_lock_label(language: LanguageId) -> &'static str {
+    match language {
+        LanguageId::SimplifiedChinese => "锁定当前屏",
+        LanguageId::TraditionalChinese => "鎖定目前螢幕",
+        _ => "Lock to current display",
     }
 }
 
-fn refresh_taskbar_selection(hwnd: HWND) {
-    let taskbars = native_interop::find_taskbars();
-    if taskbars.is_empty() {
-        return;
-    }
-    let (preferred, legacy_index, current) = {
+fn toggle_monitor_lock(hwnd: HWND) {
+    let (old, current, language) = {
         let state = lock_state();
         let Some(s) = state.as_ref() else { return };
-        (s.monitor_device.clone(), s.taskbar_index, s.taskbar_hwnd)
+        (s.locked_monitor.clone(), s.taskbar_hwnd, s.language)
     };
-    let index = preferred_taskbar_index(&taskbars, preferred.as_deref(), legacy_index);
-    if current != Some(taskbars[index].hwnd) {
-        attach_to_taskbar(hwnd, index);
+    let actual_parent = unsafe { GetParent(hwnd).ok() };
+    let current_target = native_interop::find_taskbars()
+        .into_iter()
+        .find(|bar| Some(bar.hwnd) == current && Some(bar.hwnd) == actual_parent)
+        .and_then(|bar| MonitorLock::from_taskbar(&bar));
+    let target = if old.is_some() {
+        None
+    } else {
+        if current_target.is_none() {
+            show_error_message(
+                hwnd,
+                monitor_lock_label(language),
+                if matches!(
+                    language,
+                    LanguageId::SimplifiedChinese | LanguageId::TraditionalChinese
+                ) {
+                    "当前任务栏暂不可用，请等显示器恢复后再锁定。"
+                } else {
+                    "The current taskbar is unavailable. Wait for the display to return and try again."
+                },
+            );
+            return;
+        }
+        current_target.clone()
+    };
+    let old_preference = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else { return };
+        let previous = s.monitor_device.clone();
+        if let Some(current_target) = current_target
+            .filter(|current| old.as_ref().is_none_or(|locked| locked.matches(current)))
+        {
+            s.monitor_device = Some(current_target.device);
+        }
+        s.locked_monitor = target;
+        previous
+    };
+    if !save_state_settings() {
+        if let Some(s) = lock_state().as_mut() {
+            s.locked_monitor = old;
+            s.monitor_device = old_preference;
+        }
+        show_error_message(
+            hwnd,
+            monitor_lock_label(language),
+            if matches!(
+                language,
+                LanguageId::SimplifiedChinese | LanguageId::TraditionalChinese
+            ) {
+                "无法保存锁屏设置，请检查设置目录的写入权限。"
+            } else {
+                "Unable to save the display lock. Check that the settings directory is writable."
+            },
+        );
+        return;
     }
+    diagnose::log(if old.is_some() {
+        "display lock disabled"
+    } else {
+        "display lock enabled"
+    });
+    update_taskbar_tracking(hwnd);
 }
 
 fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)> {
@@ -2247,8 +2425,6 @@ pub fn run() {
         diagnose::log(format!("main window created hwnd={:?}", hwnd));
 
         let is_dark = theme::is_dark_mode();
-        let mut embedded = false;
-
         {
             let mut state = lock_state();
             *state = Some(AppState {
@@ -2302,6 +2478,8 @@ pub fn run() {
                 last_update_check_unix: settings.last_update_check_unix,
                 taskbar_index: settings.taskbar_index,
                 monitor_device: settings.monitor_device.clone(),
+                locked_monitor: settings.locked_monitor.clone(),
+                waiting_for_locked_monitor: false,
                 tray_offset: settings.tray_offset,
                 anchor_left: settings.anchor_left,
                 dragging: false,
@@ -2312,19 +2490,8 @@ pub fn run() {
             });
         }
 
-        // Try to embed in taskbar
-        let taskbars = native_interop::find_taskbars();
-        let selected_index = preferred_taskbar_index(
-            &taskbars,
-            settings.monitor_device.as_deref(),
-            settings.taskbar_index,
-        );
-        if attach_to_taskbar(hwnd, selected_index) {
-            embedded = true;
-        } else {
-            // During login Explorer may create its taskbar after this app starts.
-            SetTimer(hwnd, TIMER_TASKBAR_RETRY, 2_000, None);
-        }
+        // Explorer may still be creating its taskbars during login.
+        let embedded = update_taskbar_tracking(hwnd);
 
         // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
         if !embedded {
@@ -2345,10 +2512,7 @@ pub fn run() {
 
         // Position and show (only if widget_visible preference is true)
         position_at_taskbar();
-        if settings.widget_visible {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        }
-        diagnose::log("window shown");
+        sync_widget_visibility(hwnd);
 
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
         render_layered();
@@ -2410,7 +2574,7 @@ fn update_quota_tooltips() {
         let state = lock_state();
         let Some(s) = state.as_ref() else { return };
         let mut regions = Vec::new();
-        if !s.dragging {
+        if s.widget_visible && !s.waiting_for_locked_monitor && !s.dragging {
             let chinese = s.language == LanguageId::SimplifiedChinese;
             let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
             let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
@@ -3187,7 +3351,7 @@ fn position_at_taskbar() {
         };
 
         // Don't fight the user's drag
-        if s.dragging {
+        if s.dragging || s.waiting_for_locked_monitor {
             return;
         }
 
@@ -3298,29 +3462,33 @@ fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> 
     (anchor_bottom - widget_height).max(anchor_top)
 }
 
-/// WinEvent callback for tray icon location changes
-unsafe extern "system" fn on_tray_location_changed(
+/// React to tray layout changes and recheck a locked taskbar when Windows moves it.
+unsafe extern "system" fn on_taskbar_location_changed(
     _hook: HWINEVENTHOOK,
     _event: u32,
     hwnd: HWND,
-    _id_object: i32,
-    _id_child: i32,
+    id_object: i32,
+    id_child: i32,
     _thread: u32,
     _time: u32,
 ) {
     static LAST_REPOSITION: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
-    let is_tray = {
+    let (is_tray, locked_widget) = {
         let state = lock_state();
-        state
-            .as_ref()
-            .and_then(|s| s.tray_notify_hwnd)
-            .map(|h| h == hwnd)
-            .unwrap_or(false)
+        let Some(s) = state.as_ref() else { return };
+        let locked_taskbar_moved = s.locked_monitor.is_some()
+            && s.taskbar_hwnd == Some(hwnd)
+            && id_object == OBJID_WINDOW.0
+            && id_child == 0;
+        (
+            s.tray_notify_hwnd == Some(hwnd),
+            locked_taskbar_moved.then_some(s.hwnd),
+        )
     };
 
-    if is_tray {
-        if tray_reposition_is_suppressed() {
+    if is_tray || locked_widget.is_some() {
+        if locked_widget.is_none() && tray_reposition_is_suppressed() {
             return;
         }
 
@@ -3338,6 +3506,9 @@ unsafe extern "system" fn on_tray_location_changed(
             }
         };
         if should_reposition {
+            if let Some(widget) = locked_widget {
+                refresh_taskbar_selection(widget.to_hwnd());
+            }
             position_at_taskbar();
             render_layered();
         }
@@ -3416,7 +3587,7 @@ unsafe extern "system" fn wnd_proc(
             }
             refresh_dpi();
             if msg == WM_DISPLAYCHANGE {
-                refresh_taskbar_selection(hwnd);
+                update_taskbar_tracking(hwnd);
             }
             position_at_taskbar();
             render_layered();
@@ -3434,22 +3605,9 @@ unsafe extern "system" fn wnd_proc(
                     schedule_countdown_timer();
                 }
                 TIMER_TASKBAR_RETRY => {
-                    let attachment = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| (s.embedded, s.taskbar_index))
-                    };
-                    match attachment {
-                        Some((true, _)) | None => {
-                            let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
-                        }
-                        Some((false, index)) => {
-                            if attach_to_taskbar(hwnd, index) {
-                                let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
-                                position_at_taskbar();
-                                render_layered();
-                                diagnose::log("taskbar attached after startup retry");
-                            }
-                        }
+                    let ready = refresh_taskbar_selection(hwnd);
+                    if !taskbar_tracking_needed(ready) {
+                        let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
                     }
                 }
                 TIMER_FRESHNESS => {
@@ -3517,7 +3675,14 @@ unsafe extern "system" fn wnd_proc(
                 s.drag_start_client_x = client_x;
                 s.drag_start_offset = s.tray_offset;
             }
+            drop(state);
             SetCapture(hwnd);
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            if let Some(s) = lock_state().as_mut() {
+                s.dragging = false;
+            }
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -3624,7 +3789,11 @@ unsafe extern "system" fn wnd_proc(
                 if let Some(s) = state.as_mut() {
                     if s.dragging {
                         s.dragging = false;
-                        Some((s.taskbar_index, s.drag_start_client_x))
+                        Some((
+                            s.taskbar_hwnd,
+                            s.drag_start_client_x,
+                            s.locked_monitor.is_some(),
+                        ))
                     } else {
                         None
                     }
@@ -3632,25 +3801,22 @@ unsafe extern "system" fn wnd_proc(
                     None
                 }
             };
-            if let Some((current_taskbar_index, drag_start_client_x)) = drag_result {
+            if let Some((current_taskbar, drag_start_client_x, locked)) = drag_result {
                 let _ = ReleaseCapture();
-                if let Some((target_index, target_taskbar)) = taskbar_at_point(pt) {
-                    if target_index != current_taskbar_index {
+                if let Some((target_index, target_taskbar)) =
+                    (!locked).then(|| taskbar_at_point(pt)).flatten()
+                {
+                    if Some(target_taskbar.hwnd) != current_taskbar {
                         let new_offset = offset_for_drop_point(
                             target_taskbar.hwnd,
                             target_taskbar.rect,
                             pt,
                             drag_start_client_x,
                         );
-                        {
+                        if attach_to_taskbar(hwnd, target_index, target_taskbar) {
                             let mut state = lock_state();
                             if let Some(s) = state.as_mut() {
                                 s.tray_offset = new_offset;
-                            }
-                        }
-                        if attach_to_taskbar(hwnd, target_index) {
-                            let mut state = lock_state();
-                            if let Some(s) = state.as_mut() {
                                 s.monitor_device =
                                     native_interop::taskbar_monitor_device(&target_taskbar);
                             }
@@ -3678,6 +3844,7 @@ unsafe extern "system" fn wnd_proc(
                     show_warmup_settings(hwnd);
                 }
                 IDM_RESTART => restart_from_menu(hwnd),
+                IDM_LOCK_MONITOR => toggle_monitor_lock(hwnd),
                 1 => {
                     {
                         let mut state = lock_state();
@@ -3759,8 +3926,14 @@ unsafe extern "system" fn wnd_proc(
                     .contains(&id) =>
                 {
                     let index = (id - IDM_MONITOR_FIRST) as usize;
-                    if let Some(taskbar) = native_interop::find_taskbars().get(index).copied() {
-                        if attach_to_taskbar(hwnd, index) {
+                    let locked = lock_state()
+                        .as_ref()
+                        .is_some_and(|s| s.locked_monitor.is_some());
+                    if let Some(taskbar) = (!locked)
+                        .then(native_interop::find_taskbars)
+                        .and_then(|taskbars| taskbars.get(index).copied())
+                    {
+                        if attach_to_taskbar(hwnd, index, taskbar) {
                             {
                                 let mut state = lock_state();
                                 if let Some(s) = state.as_mut() {
@@ -4537,27 +4710,60 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(reset_pos_str.as_ptr()),
         );
 
-        let taskbars = native_interop::find_taskbars();
-        if taskbars.len() > 1 {
-            let selected_taskbar = {
+        {
+            let taskbars = native_interop::find_taskbars();
+            let (selected_taskbar, locked, waiting) = {
                 let state = lock_state();
-                state.as_ref().and_then(|s| s.taskbar_hwnd)
+                state
+                    .as_ref()
+                    .map(|s| {
+                        (
+                            s.taskbar_hwnd,
+                            s.locked_monitor.is_some(),
+                            s.waiting_for_locked_monitor,
+                        )
+                    })
+                    .unwrap_or_default()
             };
             let monitor_menu = CreatePopupMenu().unwrap();
+            let lock_label = native_interop::wide_str(monitor_lock_label(language));
+            let lock_flags = if locked {
+                MF_CHECKED
+            } else if selected_taskbar.is_none() {
+                MF_GRAYED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                monitor_menu,
+                lock_flags,
+                IDM_LOCK_MONITOR as usize,
+                PCWSTR(lock_label.as_ptr()),
+            );
+            if !taskbars.is_empty() {
+                let _ = AppendMenuW(monitor_menu, MF_SEPARATOR, 0, PCWSTR::null());
+            }
             for (index, taskbar) in taskbars.iter().take(MAX_MONITOR_MENU_ITEMS).enumerate() {
                 let device = native_interop::taskbar_monitor_device(taskbar)
                     .unwrap_or_else(|| format!("{}", index + 1));
-                let label = if language == LanguageId::SimplifiedChinese {
+                let label = if language == LanguageId::SimplifiedChinese && taskbar.is_primary {
+                    format!("显示器 {} ({device}，主屏)", index + 1)
+                } else if language == LanguageId::SimplifiedChinese {
                     format!("显示器 {} ({device})", index + 1)
+                } else if taskbar.is_primary {
+                    format!("Display {} ({device}, primary)", index + 1)
                 } else {
                     format!("Display {} ({device})", index + 1)
                 };
                 let wide = native_interop::wide_str(&label);
-                let flags = if selected_taskbar == Some(taskbar.hwnd) {
+                let mut flags = if !waiting && selected_taskbar == Some(taskbar.hwnd) {
                     MF_CHECKED
                 } else {
                     MENU_ITEM_FLAGS(0)
                 };
+                if locked {
+                    flags |= MF_GRAYED;
+                }
                 let _ = AppendMenuW(
                     monitor_menu,
                     flags,
@@ -5278,11 +5484,84 @@ mod tests {
     fn chosen_monitor_device_survives_settings_round_trip() {
         let settings = SettingsFile {
             monitor_device: Some(r"\\.\DISPLAY2".to_string()),
+            locked_monitor: Some(MonitorLock {
+                device: r"\\.\DISPLAY2".into(),
+                interface: Some("monitor-interface-A".into()),
+            }),
             ..SettingsFile::default()
         };
         let json = serde_json::to_string(&settings).unwrap();
         let restored: SettingsFile = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.monitor_device, settings.monitor_device);
+        let lock = restored.locked_monitor.unwrap();
+        assert_eq!(lock.device, r"\\.\DISPLAY2");
+        assert_eq!(lock.interface.as_deref(), Some("monitor-interface-A"));
+        let legacy: SettingsFile = serde_json::from_str(&test_settings_json("zh-CN")).unwrap();
+        assert!(legacy.locked_monitor.is_none());
+    }
+
+    #[test]
+    fn display_selection_honors_the_lock_across_taskbar_order_and_device_number_changes() {
+        let main = native_interop::TaskbarWindow {
+            hwnd: HWND(1 as *mut _),
+            rect: RECT::default(),
+            is_primary: true,
+        };
+        let secondary = native_interop::TaskbarWindow {
+            hwnd: HWND(2 as *mut _),
+            is_primary: false,
+            ..main
+        };
+        let saved = MonitorLock {
+            device: r"\\.\DISPLAY1".into(),
+            interface: Some("monitor-interface-A".into()),
+        };
+        let resolve = |bar: &native_interop::TaskbarWindow| {
+            Some(if bar.hwnd == main.hwnd {
+                MonitorLock {
+                    device: r"\\.\DISPLAY2".into(),
+                    interface: Some("monitor-interface-A".into()),
+                }
+            } else {
+                MonitorLock {
+                    device: r"\\.\DISPLAY1".into(),
+                    interface: Some("monitor-interface-B".into()),
+                }
+            })
+        };
+        assert_eq!(
+            preferred_taskbar_index(
+                &[secondary, main],
+                Some(&saved.device),
+                0,
+                Some(&saved),
+                resolve
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            preferred_taskbar_index(
+                &[main, secondary],
+                Some(&saved.device),
+                1,
+                Some(&saved),
+                resolve
+            ),
+            Some(0)
+        );
+        // Windows reused the saved DISPLAY number on a different monitor.
+        assert_eq!(
+            preferred_taskbar_index(&[secondary], Some(&saved.device), 0, Some(&saved), resolve),
+            None
+        );
+        assert_eq!(
+            preferred_taskbar_index(&[secondary, main], None, 0, None, resolve),
+            Some(1)
+        );
+        assert_eq!(
+            preferred_taskbar_index(&[secondary, main], Some(r"\\.\DISPLAY3"), 0, None, resolve),
+            Some(1)
+        );
     }
 
     #[test]
